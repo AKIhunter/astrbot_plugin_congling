@@ -224,23 +224,58 @@ class EmotionService:
 
     @staticmethod
     def _scene_and_audience(session_kind: str, session_id: str) -> tuple[str, str]:
-        if session_kind == "group":
+        if session_kind == "group" and session_id:
             return f"group:{session_id}", f"origin_group:{session_id}"
-        return f"private:{session_id}", "self_private"
+        if session_kind == "private" and session_id:
+            return f"private:{session_id}", "self_private"
+        return "", ""
+
+    @staticmethod
+    def _valid_scene(scene: str, audience: str) -> bool:
+        # 缺失或矛盾的来源不能进入提示词，也不能扩大为稳定模式。
+        if audience == "self_private":
+            return scene == "private" or (scene.startswith("private:") and bool(scene[8:]))
+        if audience.startswith("origin_group:") and audience[13:]:
+            return scene == f"group:{audience[13:]}"
+        if audience == "public":
+            return scene.split(":", 1)[0] in {"video_comment", "video_thread", "public"}
+        return False
 
     # ------------------------------------------------------------ 当前状态
-    async def current_state(self, person_key: str) -> dict[str, Any] | None:
+    async def current_state(
+        self, person_key: str, *, audience: str = "", scene: str = "", source_account: str = "",
+        admin: bool = False,
+    ) -> dict[str, Any] | None:
         key = str(person_key or "").strip()
-        if not key:
+        # 无受众默认拒绝；不把管理面板的全量可见性带到聊天读取。
+        if not key or (not audience and not admin):
             return None
         now = int(time.time())
         row = await self.store.fetch_one(
-            "SELECT * FROM persona_state WHERE persona_id=? AND scope='user' "
-            "AND subject_id=? AND COALESCE(emotion_expires_at,0) > ? "
-            "ORDER BY emotion_updated_at DESC LIMIT 1",
-            (self.persona_id, key, now),
+            "SELECT s.*, e.audience, e.scene, e.source_account, e.occurred_at "
+            "FROM persona_state s JOIN emotion_event e ON e.id=s.source_event_id "
+            "AND e.persona_id=s.persona_id AND e.person_id=s.subject_id "
+            "WHERE s.persona_id=? AND s.scope='user' AND s.subject_id=? "
+            "AND COALESCE(s.emotion_expires_at,0)>? AND e.occurred_at>? AND e.occurred_at<=?",
+            (self.persona_id, key, now, now - self.state_ttl(), now),
         )
-        return row or None
+        if not row or not self._valid_scene(str(row["scene"]), str(row["audience"])):
+            return None
+        # 严格同受众读取；群还需同平台，避免两个平台的同号群串读。
+        if not admin:
+            if row["audience"] != audience:
+                return None
+            if scene and row["scene"] != scene:
+                return None
+            if audience.startswith("origin_group:"):
+                platform = normalize_platform(source_account.split(":", 1)[0])
+                origin_platform = normalize_platform(str(row["source_account"]).split(":", 1)[0])
+                if not platform or platform != origin_platform:
+                    return None
+        row["emotion_expires_at"] = min(
+            int(row["emotion_expires_at"]), int(row["occurred_at"]) + self.state_ttl()
+        )
+        return row
 
     async def prompt_line(self, event: Any) -> str:
         """只在 inject 模式下返回；当前状态只取未过期的一条。"""
@@ -249,9 +284,22 @@ class EmotionService:
         try:
             platform = normalize_platform(event.get_platform_name())
             sender = str(event.get_sender_id() or "")
+            # 此入口使用 QQ 事件的明确会话类型；其他适配器应走带受众的查询。
+            if platform != "qq" or not sender:
+                return ""
+            group = str(event.get_group_id() or "")
+            if group:
+                scene, audience = self._scene_and_audience("group", group)
+            elif event.is_private_chat():
+                scene, audience = self._scene_and_audience("private", sender)
+            else:
+                return ""
             source_account = source_account_for(platform, sender)
             person = await self._resolve_person(platform, sender, source_account)
-            row = await self.current_state(person)
+            row = await self.current_state(
+                person, audience=audience, source_account=source_account,
+                scene=scene if group else "",
+            )
             if not row:
                 return ""
             mood = str(row.get("mood") or "").strip()
@@ -316,26 +364,26 @@ class EmotionService:
         occurred_at: int,
     ) -> None:
         now = int(time.time())
-        expires = now + self.state_ttl()
-        row = await self.store.fetch_one(
-            "SELECT subject_id FROM persona_state WHERE persona_id=? AND scope='user' AND subject_id=?",
-            (self.persona_id, person),
-        )
-        if row:
-            await self.store.execute(
-                "UPDATE persona_state SET mood=?, emotion_intensity=?, emotion_reason=?, "
-                "source_event_id=?, emotion_updated_at=?, emotion_expires_at=?, "
-                "emotion_confidence=?, last_active=? WHERE persona_id=? AND scope='user' AND subject_id=?",
-                (label, intensity, reason, event_id, now, expires, confidence, occurred_at,
-                 self.persona_id, person),
-            )
+        expires = occurred_at + self.state_ttl()
+        # 历史仍保留为事件，但过期或未来事件不能成为当前状态。
+        if occurred_at <= 0 or occurred_at > now or expires <= now:
             return
+        # 单条 UPSERT 防止并发/迟到事件覆盖更新状态；旧库优先回查事件发生时间。
         await self.store.execute(
             "INSERT INTO persona_state(persona_id, scope, subject_id, intimacy, mood, energy, busy, "
             "last_active, emotion_intensity, emotion_reason, source_event_id, emotion_updated_at, "
-            "emotion_expires_at, emotion_confidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "emotion_expires_at, emotion_confidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(persona_id,scope,subject_id) DO UPDATE SET "
+            "mood=excluded.mood, emotion_intensity=excluded.emotion_intensity, "
+            "emotion_reason=excluded.emotion_reason, source_event_id=excluded.source_event_id, "
+            "emotion_updated_at=excluded.emotion_updated_at, emotion_expires_at=excluded.emotion_expires_at, "
+            "emotion_confidence=excluded.emotion_confidence, last_active=excluded.last_active "
+            "WHERE excluded.emotion_updated_at>=COALESCE("
+            "(SELECT occurred_at FROM emotion_event WHERE id=persona_state.source_event_id "
+            "AND persona_id=persona_state.persona_id AND person_id=persona_state.subject_id), "
+            "persona_state.emotion_updated_at,0)",
             (self.persona_id, "user", person, 0.12, label, 0.7, 0, occurred_at,
-             intensity, reason, event_id, now, expires, confidence),
+             intensity, reason, event_id, occurred_at, expires, confidence),
         )
 
     # ------------------------------------------------------------ 规则粗判
@@ -437,18 +485,21 @@ class EmotionService:
             await self._save_runtime(last_sample_at=now)
             return await self._note_skip("没有新消息")
 
-        # 按人聚合，取这段窗口里说得最多的那个人。
-        grouped: dict[str, list[dict[str, Any]]] = {}
+        # 同账号也必须按来源场景分桶，不能让最后一条群消息替私聊内容定受众。
+        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for row in rows:
             account = source_account_for(row.get("platform") or "", str(row.get("sender_id") or ""))
-            if not account:
+            scene, audience = self._scene_and_audience(
+                str(row.get("session_kind") or ""), str(row.get("session_id") or "")
+            )
+            if not account or not audience:
                 continue
-            grouped.setdefault(account, []).append(row)
+            grouped.setdefault((account, scene, audience), []).append(row)
         if not grouped:
             await self._save_runtime(last_sample_at=now)
             return await self._note_skip("没有可识别来源")
 
-        account, items = max(grouped.items(), key=lambda pair: len(pair[1]))
+        (account, scene, audience), items = max(grouped.items(), key=lambda pair: len(pair[1]))
         if len(items) < min_messages:
             await self._save_runtime(last_sample_at=now, last_messages=len(items), last_person=account)
             return await self._note_skip(f"消息不足（{len(items)}/{min_messages}）")
@@ -461,7 +512,9 @@ class EmotionService:
 
         platform = normalize_platform(items[-1].get("platform") or "")
         person = await self._resolve_person(platform, str(items[-1].get("sender_id") or ""), account)
-        current = await self.current_state(person)
+        current = await self.current_state(
+            person, audience=audience, scene=scene, source_account=account,
+        )
         if current:
             old_label = str(current.get("mood") or "")
             old_intensity = float(current.get("emotion_intensity") or 0.0)
@@ -480,8 +533,6 @@ class EmotionService:
         }
         label = str(result["label"])
         occurred_at = int(items[-1].get("ts") or now)
-        session_kind = str(items[-1].get("session_kind") or "private")
-        scene, audience = self._scene_and_audience(session_kind, str(items[-1].get("session_id") or ""))
         source_msg_id = str(items[-1].get("msg_id") or "")
         summary = desensitize(result["summary"], 60)
         event_id = await self.store.execute(
@@ -544,7 +595,7 @@ class EmotionService:
         audience = str(payload.get("audience") or "self_private").strip()
         shareable = 1 if audience == "public" else 0
         scene = str(payload.get("scene") or "").strip()
-        occurred_at = int(payload.get("occurred_at") or time.time())
+        occurred_at = int(time.time() if payload.get("occurred_at") is None else payload["occurred_at"])
         confidence = _clamp(payload.get("confidence"), 0.1, 1.0, 0.7)
         platform = normalize_platform(str(payload.get("platform") or source_account.split(":", 1)[0]))
         account_id = str(payload.get("account_id") or source_account.split(":", 1)[-1])
@@ -595,9 +646,14 @@ class EmotionService:
             (self.persona_id, day_start), 0,
         ) or 0)
         fresh = await self.store.fetch_all(
-            "SELECT * FROM persona_state WHERE persona_id=? AND scope='user' "
-            "AND COALESCE(emotion_expires_at,0)>? ORDER BY emotion_updated_at DESC LIMIT 20",
-            (self.persona_id, int(time.time())),
+            # 管理面板也不能把旧版本写出的延长 TTL 当作有效状态。
+            "SELECT s.*, MIN(s.emotion_expires_at,e.occurred_at+?) AS verified_expires_at "
+            "FROM persona_state s JOIN emotion_event e ON e.id=s.source_event_id "
+            "AND e.persona_id=s.persona_id AND e.person_id=s.subject_id "
+            "WHERE s.persona_id=? AND s.scope='user' AND COALESCE(s.emotion_expires_at,0)>? "
+            "AND e.occurred_at>? AND e.occurred_at<=? ORDER BY s.emotion_updated_at DESC LIMIT 20",
+            (self.state_ttl(), self.persona_id, int(time.time()),
+             int(time.time()) - self.state_ttl(), int(time.time())),
         )
         return {
             "mode": self.mode(),
@@ -616,7 +672,7 @@ class EmotionService:
 
     def _state_view(self, row: dict[str, Any], runtime: dict[str, Any] | None = None) -> dict[str, Any]:
         now = int(time.time())
-        expires = int(row.get("emotion_expires_at") or 0)
+        expires = int(row.get("verified_expires_at", row.get("emotion_expires_at")) or 0)
         return {
             "person": str(row.get("subject_id") or ""),
             "mood": str(row.get("mood") or ""),
@@ -741,14 +797,19 @@ class EmotionService:
             "panel_curve": self._bool("panel_curve", True),
         }
 
-    async def state_payload(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def state_payload(self, params: dict[str, Any], *, admin: bool = False) -> dict[str, Any]:
         person = str(params.get("person") or params.get("person_id") or "").strip()
         source_account = str(params.get("source_account") or "").strip()
         if not person and source_account:
             platform = normalize_platform(source_account.split(":", 1)[0])
             account_id = source_account.split(":", 1)[-1]
             person = await self._resolve_person(platform, account_id, source_account)
-        row = await self.current_state(person) if person else None
+        # 只透传调用方明确的受众；缺上下文仍可查询 affinity，不返回情绪正文。
+        row = await self.current_state(
+            person, audience=str(params.get("audience") or "").strip(),
+            scene=str(params.get("scene") or "").strip(), source_account=source_account,
+            admin=admin,
+        ) if person else None
         affinity = None
         if person or source_account:
             affinity = await self.store.fetch_one(
@@ -783,17 +844,22 @@ class EmotionService:
         if not self._bool("write_pattern_to_memory", True) or not person:
             return False
         now = int(time.time())
+        if not self._valid_scene(scene, audience) or not now - 7 * 86400 <= occurred_at <= now:
+            return False
+        # 证据计数和去重键使用同一边界，私聊/跨群/跨平台均不能互相凑次数。
         count = int(await self.store.scalar(
             "SELECT COUNT(*) FROM emotion_event WHERE persona_id=? AND person_id=? "
-            "AND label=? AND occurred_at>=?",
-            (self.persona_id, person, label, now - 7 * 86400), 0,
+            "AND source_account=? AND scene=? AND audience=? AND label=? "
+            "AND occurred_at>=? AND occurred_at<=?",
+            (self.persona_id, person, source_account, scene, audience, label, now - 7 * 86400, now), 0,
         ) or 0)
         if count < 3:
             return False
         memo = await self.store.kv_get(self.KV_PATTERNS, {})
         memo = memo if isinstance(memo, dict) else {}
-        key = f"{person}|{label}"
-        last = int(memo.get(key) or 0)
+        key = json.dumps([person, source_account, scene, audience, label], ensure_ascii=True)
+        # 旧版全局冷却没有场景证据，保守保留到期；新增冷却只影响自身场景。
+        last = max(int(memo.get(key) or 0), int(memo.get(f"{person}|{label}") or 0))
         if last and now - last < self._int("retention_days", 30, 1, 365) * 86400:
             return False
         try:

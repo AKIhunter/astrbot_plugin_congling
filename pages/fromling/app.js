@@ -2473,7 +2473,8 @@ const bindingEditFields = [
   ["evidence_ref", "依据引用"], ["note", "备注"],
 ];
 /* 上传草稿要跨重绘保留：预览拿到令牌后，执行时必须用同一份内容 */
-const bindingUpload = { content: "", filename: "", mode: "merge", preview: null };
+const bindingUpload = { content: "", filename: "", mode: "merge", preview: null,
+  revision: 0, fileReadId: 0, fileState: "idle" };
 
 function bindingStatusCN(status) {
   return {
@@ -2807,10 +2808,14 @@ async function renderBindings() {
       askToast("审核要填审核人和依据（可复用上方输入）", "err");
       return;
     }
+    // 绑定本次页面展示的完整快照，不在点击时另取可能已经换人的候选。
+    const expectedCandidate = (candidates.items || []).find((row) => row.candidate_id === candidateId);
+    if (!expectedCandidate) { askToast("候选已变化，请刷新后重新审核", "err"); return; }
     if (!(await askConfirm(`${approve ? "通过" : "驳回"}这条候选？`, { ok: approve ? "通过" : "驳回" }))) return;
     try {
       await post("page/bindings/candidates/review", {
         candidate_id: candidateId,
+        expected_candidate: expectedCandidate,
         approve,
         reviewer: bindingOps.reviewer,
         reason: bindingOps.reason,
@@ -2857,6 +2862,7 @@ async function renderBindings() {
     readOps();
   };
   const invalidateUploadPreview = () => {
+    bindingUpload.revision += 1;
     bindingUpload.preview = null;
     const confirmed = document.getElementById("bind-preview-confirmed");
     if (confirmed) confirmed.checked = false;
@@ -2865,28 +2871,65 @@ async function renderBindings() {
   };
   const uploadContent = document.getElementById("bind-content");
   const uploadMode = document.getElementById("bind-mode");
-  if (uploadContent) uploadContent.oninput = () => { readUploadDraft(); invalidateUploadPreview(); };
+  const fileUnavailable = () => ["loading", "error"].includes(bindingUpload.fileState);
+  const syncUploadAvailability = () => {
+    ["bind-upload-preview", "bind-upload-go", "bind-preview-confirmed"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.disabled = fileUnavailable();
+    });
+  };
+  if (uploadContent) uploadContent.oninput = () => {
+    // 手动输入成为新草稿，取消尚未结束的文件读取及其文件名。
+    bindingUpload.fileReadId += 1;
+    bindingUpload.fileState = "idle";
+    bindingUpload.filename = "";
+    const input = document.getElementById("bind-file");
+    if (input) input.value = "";
+    readUploadDraft();
+    invalidateUploadPreview();
+    syncUploadAvailability();
+  };
   if (uploadMode) uploadMode.onchange = () => { readUploadDraft(); invalidateUploadPreview(); };
   const fileInput = document.getElementById("bind-file");
   if (fileInput) {
     fileInput.onchange = () => {
       const file = fileInput.files && fileInput.files[0];
+      const readId = ++bindingUpload.fileReadId;
+      invalidateUploadPreview();
+      bindingUpload.fileState = file ? "loading" : "idle";
+      bindingUpload.content = "";
+      bindingUpload.filename = "";
+      const area = document.getElementById("bind-content");
+      if (area) area.value = "";
+      syncUploadAvailability();
       if (!file) return;
       const reader = new FileReader();
       reader.onload = () => {
+        // 只接受最新一次选取；旧读取的成功、失败和取消回调均不得覆盖新草稿。
+        if (readId !== bindingUpload.fileReadId) return;
         const area = document.getElementById("bind-content");
         if (area) area.value = String(reader.result || "");
         bindingUpload.filename = file.name || "";
+        bindingUpload.fileState = "idle";
         readUploadDraft();
         invalidateUploadPreview();
+        syncUploadAvailability();
         askToast("文件已读入，记得先预览", "ok");
       };
-      reader.onerror = () => askToast("读取文件失败", "err");
-      reader.readAsText(file);
+      reader.onerror = reader.onabort = () => {
+        if (readId !== bindingUpload.fileReadId) return;
+        bindingUpload.fileState = "error";
+        invalidateUploadPreview();
+        syncUploadAvailability();
+        askToast("读取文件失败，请重新选择文件或粘贴内容", "err");
+      };
+      try { reader.readAsText(file); } catch (err) { reader.onerror(); }
     };
   }
+  syncUploadAvailability();
 
   bind("bind-upload-preview", async (event) => {
+    if (fileUnavailable()) { askToast("文件未读入，请重新选择文件或粘贴内容", "err"); return; }
     readUploadDraft();
     const box = document.getElementById("bind-upload-result");
     if (!bindingUpload.content.trim()) {
@@ -2895,9 +2938,11 @@ async function renderBindings() {
     }
     event.target.disabled = true;
     invalidateUploadPreview();
+    const revision = bindingUpload.revision;
     const draft = { mode: bindingUpload.mode, content: bindingUpload.content, filename: bindingUpload.filename };
     try {
       const data = await post("page/bindings/upload/preview", draft);
+      if (revision !== bindingUpload.revision || fileUnavailable()) return;
       readUploadDraft();
       if (draft.content !== bindingUpload.content || draft.mode !== bindingUpload.mode || draft.filename !== bindingUpload.filename) return;
       bindingUpload.preview = data;
@@ -2906,12 +2951,14 @@ async function renderBindings() {
       bindingUpload.previewFilename = draft.filename;
       if (box) box.innerHTML = bindingUploadResultHtml(data);
     } catch (err) {
+      if (revision !== bindingUpload.revision) return;
       bindingUpload.preview = null;
       if (box) box.innerHTML = `<p class="hint">预览失败：${esc(err.message)}</p>`;
-    } finally { event.target.disabled = false; }
+    } finally { event.target.disabled = fileUnavailable(); }
   });
 
   bind("bind-upload-go", async (event) => {
+    if (fileUnavailable()) { askToast("文件未读入，请重新选择文件或粘贴内容", "err"); return; }
     readUploadDraft();
     if (!bindingOps.operator || !bindingOps.reason) {
       askToast("上传要填操作人和依据", "err");
@@ -2945,17 +2992,23 @@ async function renderBindings() {
     };
     const confirmText = `按 ${bindingUpload.mode} 上传 ${bindingUpload.preview.rows} 行？` +
       (bindingUpload.mode === "replace" ? `将撤销 ${bindingUpload.preview.revoke_count || 0} 条未出现的绑定。` : "");
+    const revision = bindingUpload.revision;
     event.target.disabled = true;
     try {
       if (!(await askConfirm(confirmText, { ok: "上传" }))) return;
+      if (revision !== bindingUpload.revision || fileUnavailable()) {
+        askToast("草稿已变化，请重新预览", "err");
+        return;
+      }
       const result = await post("page/bindings/upload", payload);
       askToast(`已上传：新增 ${result.created || 0} / 更新 ${result.updated || 0} / 冲突 ${(result.conflicts || []).length} / 错误 ${(result.errors || []).length}`, "ok");
+      if (revision !== bindingUpload.revision) return;
       bindingUpload.preview = null;
       bindingUpload.content = "";
       bindingUpload.filename = "";
       render();
     } catch (err) { askToast(err.message, "err"); }
-    finally { event.target.disabled = false; }
+    finally { event.target.disabled = fileUnavailable(); }
   });
 
   bind("bind-auto-save", async () => {

@@ -143,6 +143,16 @@ def _parse_csv(content: str) -> tuple[list[dict[str, Any]], list[str]]:
     return rows, errors
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """在解析阶段拒绝重复键，避免字段被静默覆盖后参与 replace。"""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 有重复键：{key}")
+        result[key] = value
+    return result
+
+
 def _parse_upload(content: str, filename: str = "") -> tuple[list[dict[str, Any]], list[str]]:
     """兼容 JSON 数组 / {"rows": []} / {"bindings": []} 与 CSV，列名支持中英文别名。"""
     text = str(content or "").lstrip("\ufeff")
@@ -152,8 +162,8 @@ def _parse_upload(content: str, filename: str = "") -> tuple[list[dict[str, Any]
     looks_json = lower_name.endswith(".json") or text.lstrip()[:1] in {"[", "{"}
     if looks_json:
         try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
+            payload = json.loads(text, object_pairs_hook=_unique_json_object)
+        except ValueError as exc:
             return [], [f"JSON 解析失败：{exc}"]
         if isinstance(payload, dict):
             payload = next((payload[key] for key in ("rows", "bindings", "items") if key in payload), None)
@@ -403,6 +413,7 @@ class BindingMixin:
             result = await lm.review_binding_candidate(
                 candidate_id, approve=_boolean(body, "approve"),
                 reviewer=reviewer, reason=reason, request_id=uuid4().hex,
+                expected_candidate=body.get("expected_candidate"),
             )
             if result is None:
                 return _err("候选不存在或已审核")

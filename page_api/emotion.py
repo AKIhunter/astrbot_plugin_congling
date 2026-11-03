@@ -203,6 +203,7 @@ class EmotionMixin:
             service = self._emotion()
             if service is None:
                 return _err("情绪模块未就绪")
-            return _ok(await service.state_payload(await _params()))
+            # 此路由属于鉴权管理面板；回复读取不得从请求参数开启管理可见性。
+            return _ok(await service.state_payload(await _params(), admin=True))
         except Exception as exc:
             return _err(repr(exc)[:200])
