@@ -114,6 +114,9 @@ class MemoryHit:
         mark = " 【重要】" if self.importance >= 0.85 else ""
         prefix = f"({stamp}) " if stamp else ""
         where = f"[{self.session_label}] " if self.session_label else ""
+        # 阶段 3（回写）：情绪条目属于「过去经历」，必须带日期，不能当成当前心情。
+        if self.kind == "emotion":
+            where = f"[过去经历·{self.session_label}] " if self.session_label else "[过去经历] "
         weak = "【弱相关】" if self.weak_related else ""
         return f"- {weak}{prefix}{where}{self.text}{mark}"
 

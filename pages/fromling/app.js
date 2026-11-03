@@ -980,6 +980,7 @@ const VIEWS = {
   persona: { title: "人格", render: renderPersona },
   behavior: { title: "行为", render: renderBehavior },
   memory: { title: "记忆", render: renderMemory },
+  emotion: { title: "情绪与关系", render: renderEmotion },
   night: { title: "长夜", render: renderNight },
   diary: { title: "日记", render: renderDiary },
   tools: { title: "工具", render: renderTools },
@@ -2185,6 +2186,228 @@ async function renderMemory(keyword, sessionId, kind) {
     }
   });
 }
+
+/* ------------------------------------------------ 情绪与关系（阶段 3）
+   入口只在从绫详情页的这一个一级 Tab；不加 Bot Manager / 集成平台入口。
+   首周 observe_only：时间线和曲线只用于观察，不参与回复。 */
+let emotionRange = "24h";
+let emotionPage = 1;
+const emotionFilter = { person: "", from: "", to: "", label: "" };
+
+function fmtEmotionRange(range) {
+  return { "24h": "24 小时", "7d": "7 天", "30d": "30 天" }[range] || range;
+}
+
+async function renderEmotion() {
+  const [overview, config] = await Promise.all([
+    get("page/emotion/overview"),
+    get("page/emotion/config"),
+  ]);
+  const events = await get("page/emotion/events", {
+    person: emotionFilter.person,
+    from: emotionFilter.from,
+    to: emotionFilter.to,
+    label: emotionFilter.label,
+    page: emotionPage,
+    limit: 20,
+  });
+  const curve = overview.panel_curve
+    ? await get("page/emotion/curve", { range: emotionRange })
+    : null;
+  const observe = config.observe || {};
+  const bili = config.bili || {};
+  const states = overview.states || [];
+  const runtime = overview.runtime || {};
+  const labels = events.labels || config.labels || [];
+
+  const stateCard = states.length
+    ? states.map((row) => `<div class="cfg-group">
+        <div class="cfg-head"><h3>${esc(row.person || "当前")}</h3>
+          <p>${esc(row.observe_only ? "observe_only：只观察，不参与回复" : "inject：会作为当前心情注入")}</p></div>
+        <div class="pad">
+          <div class="grid-stats">
+            <div class="stat"><span class="stat-label">心情</span><span class="stat-num">${esc(row.mood || "—")}</span></div>
+            <div class="stat"><span class="stat-label">强度</span><span class="stat-num">${Math.round((row.intensity || 0) * 100)}%</span></div>
+            <div class="stat"><span class="stat-label">精力</span><span class="stat-num">${Math.round((row.energy || 0) * 100)}%</span></div>
+            <div class="stat"><span class="stat-label">忙碌</span><span class="stat-num">${row.busy ? "是" : "否"}</span></div>
+          </div>
+          <p class="hint" style="margin:10px 0 0">原因：${esc(row.reason || "—")}</p>
+          <p class="hint" style="margin:4px 0 0">更新 ${fmtTime(row.updated_at)} · 过期 ${fmtTime(row.expires_at)} · 来源事件 #${esc(row.source_event_id || 0)}</p>
+        </div>
+      </div>`).join("")
+    : `<div class="cfg-group"><div class="cfg-head"><h3>当前状态</h3><p>还没有未过期的情绪记录</p></div>
+        <div class="pad"><p class="hint">先积累几条消息，或点「现在采样一次」。</p></div></div>`;
+
+  const timeline = (events.items || []).length
+    ? `<div class="plain-list">${events.items.map((row) => `<div class="atom-row">
+        <div class="grow">
+          <div class="atom-text">${esc(row.summary || "—")}</div>
+          <div class="hint">${esc(row.person_id || row.source_account || "")} · ${esc(row.label || "")}
+            · ${Math.round((row.intensity || 0) * 100)}% · ${fmtTime(row.occurred_at)}
+            · ${esc(row.audience || "")}${row.shareable ? " · 可共享" : ""}</div>
+        </div>
+      </div>`).join("")}</div>`
+    : `<p class="hint">这个筛选条件下还没有事件</p>`;
+
+  const bars = curve
+    ? (curve.points || []).map((point) => `<div class="emo-bar" title="${esc(point.label)} ${point.count} 条">
+        <i style="height:${Math.max(3, Math.round((point.intensity || 0) * 100))}%"></i>
+        <span>${esc(point.label)}</span>
+      </div>`).join("")
+    : "";
+
+  const observeRows = [
+    ["enabled", "启用情绪观察", "bool"],
+    ["mode", "观察模式", "select", ["observe_only", "inject"]],
+    ["sample_interval_minutes", "采样间隔（分钟）", "number"],
+    ["min_messages", "至少积累几条", "number"],
+    ["window_minutes", "分析窗口（分钟）", "number"],
+    ["state_ttl_minutes", "状态有效期（分钟）", "number"],
+    ["retention_days", "事件保留天数", "number"],
+    ["max_events_per_day", "每日事件上限", "number"],
+    ["write_pattern_to_memory", "稳定模式写入长久记忆", "bool"],
+    ["panel_curve", "面板显示情绪曲线", "bool"],
+  ];
+  const fieldRow = ([key, label, kind, options]) => {
+    if (kind === "bool") {
+      return `<div class="field"><label>${label}</label>
+        <label class="switch"><input type="checkbox" id="emo-${key}" ${observe[key] ? "checked" : ""} /> 开</label></div>`;
+    }
+    if (kind === "select") {
+      return `<div class="field"><label>${label}</label>
+        <select id="emo-${key}">${options.map((opt) => `<option value="${esc(opt)}" ${observe[key] === opt ? "selected" : ""}>${esc(opt)}</option>`).join("")}</select></div>`;
+    }
+    return `<div class="field"><label>${label}</label>
+      <input type="number" id="emo-${key}" value="${esc(observe[key] == null ? "" : observe[key])}" /></div>`;
+  };
+
+  const sampleRows = (runtime.samples || []).map((item) => `<div class="hint">${fmtTime(item.at)} · ${esc(item.outcome)}${item.label ? " · " + esc(item.label) : ""}${item.person ? " · " + esc(item.person) : ""}${item.messages ? " · " + item.messages + " 条" : ""}${item.model ? " · 模型" : ""}</div>`).join("");
+
+  view.innerHTML = `
+    ${stateCard}
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>事件时间线</h3><p>只显示脱敏摘要，不显示原文；支持按人、日期、情绪筛选</p></div>
+      <div class="pad">
+        <div class="row">
+          <div class="field"><label>人物 / 来源账号</label><input type="text" id="emo-person" value="${esc(emotionFilter.person)}" placeholder="如 qq:123456" /></div>
+          <div class="field"><label>从</label><input type="date" id="emo-from" value="${esc(emotionFilter.from)}" /></div>
+          <div class="field"><label>到</label><input type="date" id="emo-to" value="${esc(emotionFilter.to)}" /></div>
+          <div class="field"><label>情绪</label><select id="emo-label"><option value="">全部</option>${labels.map((label) => `<option value="${esc(label)}" ${emotionFilter.label === label ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></div>
+        </div>
+        <div class="row" style="margin:10px 0 12px">
+          <button class="ghost" id="emo-filter">筛选</button>
+          <button class="ghost" id="emo-reset">重置</button>
+          <button class="primary" id="emo-sample">现在采样一次</button>
+        </div>
+        ${timeline}
+        <div class="row" style="margin-top:12px">
+          <button class="ghost" id="emo-prev" ${events.page <= 1 ? "disabled" : ""}>上一页</button>
+          <span class="hint">第 ${events.page} 页 · 共 ${events.total} 条</span>
+          <button class="ghost" id="emo-next" ${events.page * events.limit >= events.total ? "disabled" : ""}>下一页</button>
+        </div>
+      </div>
+    </section>
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>情绪曲线</h3><p>${esc(overview.observe_only ? "observe_only 期间只做观察，不参与回复" : "inject 模式：未过期的当前状态会参与回复")}</p></div>
+      <div class="pad">
+        <div class="row" style="margin-bottom:10px">
+          ${["24h", "7d", "30d"].map((range) => `<button class="${emotionRange === range ? "primary" : "ghost"}" data-emo-range="${range}">${fmtEmotionRange(range)}</button>`).join("")}
+        </div>
+        ${curve ? `<div class="emo-bars">${bars || '<p class="hint">这段时间还没有事件</p>'}</div><p class="hint" style="margin-top:8px">共 ${curve.count} 条事件，柱子高度表示平均强度。</p>` : '<p class="hint">面板曲线已在配置里关闭</p>'}
+      </div>
+    </section>
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>开关与参数</h3><p>保存前校验范围；默认值与当前生效值都在这里</p></div>
+      <div class="pad">
+        <div class="row">${observeRows.map(fieldRow).join("")}</div>
+        <div class="row" style="margin-top:12px">
+          <div class="field"><label>B站读取方式</label><select id="emo-bili-mode">
+            ${["dual_read", "from_congling", "off"].map((opt) => `<option value="${esc(opt)}" ${bili.read_mode === opt ? "selected" : ""}>${esc(opt)}</option>`).join("")}
+          </select></div>
+          <div class="field"><label>双读期间继续写本地好感</label>
+            <label class="switch"><input type="checkbox" id="emo-bili-write" ${bili.write_local ? "checked" : ""} /> 开</label></div>
+          <div class="field"><label>每日对账告警阈值</label>
+            <input type="number" step="1" id="emo-bili-threshold" value="${esc(bili.reconcile_warn_threshold == null ? 15 : bili.reconcile_warn_threshold)}" /></div>
+        </div>
+        ${pageActions("保存情绪设置")}
+      </div>
+    </section>
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>运行日志</h3><p>最近采样、跳过原因、当天事件数、模型失败、被上限截断次数</p></div>
+      <div class="pad">
+        <p class="hint">最近采样：${fmtTime(runtime.last_sample_at)} · 当天事件：${overview.today.events}/${overview.today.cap}</p>
+        <p class="hint">跳过原因：${esc(runtime.last_skip_reason || "—")} · 模型失败：${runtime.model_failures || 0} · 上限截断：${runtime.cap_truncated || 0} · 模式写入：${runtime.patterns_written || 0}</p>
+        ${runtime.last_error ? `<p class="hint">最近错误：${esc(runtime.last_error)}</p>` : ""}
+        ${sampleRows || '<p class="hint">还没有采样记录</p>'}
+        <div class="row" style="margin-top:10px"><button class="ghost" id="emo-clear">清空当前状态</button></div>
+      </div>
+    </section>`;
+
+  const applyFilter = () => {
+    emotionFilter.person = (document.getElementById("emo-person") || {}).value || "";
+    emotionFilter.from = (document.getElementById("emo-from") || {}).value || "";
+    emotionFilter.to = (document.getElementById("emo-to") || {}).value || "";
+    emotionFilter.label = (document.getElementById("emo-label") || {}).value || "";
+    emotionPage = 1;
+    render();
+  };
+  const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
+  bind("emo-filter", applyFilter);
+  bind("emo-reset", () => {
+    Object.keys(emotionFilter).forEach((key) => { emotionFilter[key] = ""; });
+    emotionPage = 1;
+    render();
+  });
+  bind("emo-prev", () => { if (emotionPage > 1) { emotionPage -= 1; render(); } });
+  bind("emo-next", () => { emotionPage += 1; render(); });
+  bind("emo-sample", async (event) => {
+    event.target.disabled = true;
+    event.target.textContent = "采样中…";
+    try { await post("page/emotion/sample", {}); } catch (err) { askToast(err.message, "err"); }
+    render();
+  });
+  bind("emo-clear", async () => {
+    if (!(await askConfirm("清空当前情绪状态？时间线里的历史事件会保留。", { ok: "清空" }))) return;
+    try { await post("page/emotion/state/clear", {}); askToast("已清空", "ok"); } catch (err) { askToast(err.message, "err"); }
+    render();
+  });
+  document.querySelectorAll("[data-emo-range]").forEach((btn) => {
+    btn.onclick = () => { emotionRange = btn.dataset.emoRange; render(); };
+  });
+  const save = document.getElementById("page-save");
+  if (save) save.onclick = async () => {
+    const msg = document.getElementById("page-msg");
+    const num = (key) => Number((document.getElementById(`emo-${key}`) || {}).value);
+    const bool = (key) => !!((document.getElementById(`emo-${key}`) || {}).checked);
+    const valueOf = (key) => (document.getElementById(`emo-${key}`) || {}).value || "";
+    try {
+      await post("page/emotion/config", {
+        observe: {
+          enabled: bool("enabled"),
+          mode: valueOf("mode"),
+          sample_interval_minutes: num("sample_interval_minutes"),
+          min_messages: num("min_messages"),
+          window_minutes: num("window_minutes"),
+          state_ttl_minutes: num("state_ttl_minutes"),
+          retention_days: num("retention_days"),
+          max_events_per_day: num("max_events_per_day"),
+          write_pattern_to_memory: bool("write_pattern_to_memory"),
+          panel_curve: bool("panel_curve"),
+        },
+        bili: {
+          read_mode: valueOf("bili-mode"),
+          write_local: bool("bili-write"),
+          reconcile_warn_threshold: Number((document.getElementById("emo-bili-threshold") || {}).value),
+        },
+      });
+      settingsCache = null;
+      if (msg) msg.textContent = "已保存";
+    } catch (err) {
+      if (msg) msg.textContent = err.message;
+    }
+  };
+}
+
 
 /* ------------------------------------------------------------------ 工具 */
 async function renderTools() {

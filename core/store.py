@@ -21,7 +21,8 @@ from typing import Any
 from astrbot.api import logger
 from .exc import exc_brief
 
-SCHEMA_VERSION = 6
+# 阶段 3（回写）：v7 增加 emotion_event 与 persona_state 情绪列。
+SCHEMA_VERSION = 7
 
 _SCHEMA = [
     """
@@ -269,6 +270,26 @@ _SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_proactive_at ON proactive_log(persona_id, at)",
+    # ---- 阶段 3：情绪事件（只追加；只存脱敏摘要，不存原文）
+    """
+    CREATE TABLE IF NOT EXISTS emotion_event(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        persona_id TEXT DEFAULT 'ling',
+        person_id TEXT DEFAULT '',
+        source_account TEXT DEFAULT '',
+        scene TEXT DEFAULT '',
+        label TEXT DEFAULT '',
+        intensity REAL DEFAULT 0,
+        summary TEXT DEFAULT '',
+        source_msg_id TEXT DEFAULT '',
+        audience TEXT DEFAULT 'self_private',
+        shareable INTEGER DEFAULT 0,
+        occurred_at INTEGER,
+        created_at INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_emotion_person_time ON emotion_event(persona_id, person_id, occurred_at)",
+    "CREATE INDEX IF NOT EXISTS idx_emotion_time ON emotion_event(persona_id, occurred_at)",
     # 未爬记忆查询走这条索引，别让记忆库翻全表
     "CREATE INDEX IF NOT EXISTS idx_atom_unread ON mem_atom(persona_id, unread, status)",
 ]
@@ -388,6 +409,21 @@ class Store:
             )
         except Exception as exc:
             raise RuntimeError("msg_archive migration failed") from exc
+        # 阶段 3：当前情绪只取未过期的一条，过期/被覆盖即失效。
+        try:
+            state_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(persona_state)")}
+            for name, stmt in (
+                ("emotion_intensity", "ALTER TABLE persona_state ADD COLUMN emotion_intensity REAL DEFAULT 0"),
+                ("emotion_reason", "ALTER TABLE persona_state ADD COLUMN emotion_reason TEXT DEFAULT ''"),
+                ("source_event_id", "ALTER TABLE persona_state ADD COLUMN source_event_id INTEGER DEFAULT 0"),
+                ("emotion_updated_at", "ALTER TABLE persona_state ADD COLUMN emotion_updated_at INTEGER DEFAULT 0"),
+                ("emotion_expires_at", "ALTER TABLE persona_state ADD COLUMN emotion_expires_at INTEGER DEFAULT 0"),
+                ("emotion_confidence", "ALTER TABLE persona_state ADD COLUMN emotion_confidence REAL DEFAULT 0"),
+            ):
+                if name not in state_cols:
+                    self._conn.execute(stmt)
+        except Exception as exc:
+            logger.debug(f"[congling] persona_state 补列失败: {exc!r}")
         if "mem_level" not in columns:
             self._backfill_levels()
         self._migrate_refs(current)

@@ -3368,3 +3368,37 @@ html[data-theme="dark"] .lv-4 { background: #2f2820; }
   opacity: .5;
   transition: color .18s ease, opacity .18s ease;
 }
+
+/* 情绪曲线：竖柱 + 底部标签，高度按平均强度百分比；不引入新框架，沿用现有色板 */
+.emo-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  min-height: 120px;
+  padding: 8px 2px 0;
+  overflow-x: auto;
+}
+.emo-bar {
+  flex: 1 0 22px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 22px;
+  height: 112px;
+}
+.emo-bar i {
+  display: block;
+  width: 100%;
+  max-width: 26px;
+  border-radius: 3px 3px 0 0;
+  background: linear-gradient(180deg, var(--accent, #c8a86a), rgba(200, 168, 106, .35));
+  transition: height .18s ease;
+}
+.emo-bar span {
+  margin-top: 4px;
+  font-size: 10px;
+  line-height: 1.2;
+  opacity: .55;
+  white-space: nowrap;
+}

@@ -1592,5 +1592,112 @@
         "default": 12
       }
     }
+  },
+  "emotion": {
+    "description": "情绪与关系",
+    "hint": "阶段 3：只观察，不参与回复。首周保持 observe_only；面板入口在从绫详情页「情绪与关系」。",
+    "type": "object",
+    "items": {
+      "observe": {
+        "description": "情绪观察",
+        "hint": "先规则粗判，连续多条且变化明显才让模型归纳；无新消息跳过。",
+        "type": "object",
+        "items": {
+          "enabled": {
+            "description": "启用情绪观察",
+            "type": "bool",
+            "default": true
+          },
+          "mode": {
+            "description": "观察模式",
+            "hint": "observe_only＝只记录不注入（首周默认）；inject＝把未过期的当前状态注入提示词",
+            "type": "string",
+            "options": [
+              "observe_only",
+              "inject"
+            ],
+            "default": "observe_only"
+          },
+          "sample_interval_minutes": {
+            "description": "采样间隔（分钟）",
+            "hint": "默认 30；太短会频繁调模型",
+            "type": "int",
+            "default": 30
+          },
+          "min_messages": {
+            "description": "至少积累几条再分析",
+            "hint": "默认 5；不足就跳过，避免一句话就下结论",
+            "type": "int",
+            "default": 5
+          },
+          "window_minutes": {
+            "description": "分析窗口（分钟）",
+            "hint": "默认 60；只看这段时间内的消息",
+            "type": "int",
+            "default": 60
+          },
+          "state_ttl_minutes": {
+            "description": "当前状态有效期（分钟）",
+            "hint": "默认 120；过期后自动失效，不再当作现在的心情",
+            "type": "int",
+            "default": 120
+          },
+          "retention_days": {
+            "description": "情绪事件保留天数",
+            "hint": "默认 30；超期事件每天清理一次",
+            "type": "int",
+            "default": 30
+          },
+          "max_events_per_day": {
+            "description": "每日事件上限",
+            "hint": "默认 200，防刷；超限只记截断次数，不写事件",
+            "type": "int",
+            "default": 200
+          },
+          "write_pattern_to_memory": {
+            "description": "稳定模式写入长久记忆",
+            "hint": "默认开；只写反复出现的模式，不写单次情绪",
+            "type": "bool",
+            "default": true
+          },
+          "panel_curve": {
+            "description": "面板显示情绪曲线",
+            "hint": "默认开；关闭后仍保留数据，只是不画图",
+            "type": "bool",
+            "default": true
+          }
+        }
+      },
+      "bili": {
+        "description": "B站情绪读写",
+        "hint": "首周保持双读：BiliBot 本地好感继续写，同时把情绪事件上报给从绫。",
+        "type": "object",
+        "items": {
+          "read_mode": {
+            "description": "B站情绪读取方式",
+            "hint": "dual_read＝两边都读（默认）；from_congling＝只读从绫；off＝关闭",
+            "type": "string",
+            "options": [
+              "dual_read",
+              "from_congling",
+              "off"
+            ],
+            "default": "dual_read"
+          },
+          "write_local": {
+            "description": "双读期间继续写本地好感",
+            "hint": "默认开；关闭后 BiliBot 只上报不落本地",
+            "type": "bool",
+            "default": true
+          },
+          "reconcile_warn_threshold": {
+            "description": "每日对账告警阈值",
+            "hint": "本地好感与从绫记录差值超过该分数时告警，默认 15",
+            "type": "float",
+            "default": 15
+          }
+        }
+      }
+    }
   }
 }

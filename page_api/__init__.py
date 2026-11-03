@@ -19,6 +19,7 @@ from astrbot.api.web import request
 from ..core import paths
 from ..core.memory_guard import memory_work
 from .diary import DiaryMixin
+from .emotion import EmotionMixin
 from .memory_m3 import MemoryM3Mixin
 from .memory_v2 import MemoryV2Mixin
 from .memory_reset import MemoryResetMixin
@@ -227,7 +228,7 @@ def _schema_groups(config: Any) -> list[dict[str, Any]]:
     return groups
 
 
-class PageApi(MemoryResetMixin, ProactiveMixin, DiaryMixin, MemoryM3Mixin, MemoryV2Mixin):
+class PageApi(MemoryResetMixin, ProactiveMixin, DiaryMixin, MemoryM3Mixin, MemoryV2Mixin, EmotionMixin):
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
         self.cfg = plugin.cfg
@@ -347,6 +348,16 @@ class PageApi(MemoryResetMixin, ProactiveMixin, DiaryMixin, MemoryM3Mixin, Memor
             ("/affinity/config", self.affinity_save_config, ["POST"]),
             ("/affinity/settle", self.affinity_settle, ["POST"]),
             ("/affinity/remove", self.affinity_remove, ["POST"]),
+            # ---- 阶段 3：情绪与关系（只在从绫页面使用）
+            ("/emotion/overview", self.emotion_overview, ["GET"]),
+            ("/emotion/events", self.emotion_events, ["GET"]),
+            ("/emotion/curve", self.emotion_curve, ["GET"]),
+            ("/emotion/config", self.emotion_config_dispatch, ["GET", "POST"]),
+            ("/emotion/config/save", self.emotion_config_save, ["POST"]),
+            ("/emotion/sample", self.emotion_sample, ["POST"]),
+            ("/emotion/state/clear", self.emotion_state_clear, ["POST"]),
+            ("/emotion/ingest", self.emotion_ingest, ["POST"]),
+            ("/emotion/state", self.emotion_state, ["GET"]),
             # ---- 0.5.0 头像
             ("/avatar", self.avatar_state, ["GET"]),
             ("/avatar/set", self.avatar_set, ["POST"]),

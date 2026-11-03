@@ -96,6 +96,8 @@ class ConglingPlugin(Star):
         self.page_api: Any = None
         self.commands: Any = None
         self.lm_bridge: Any = None
+        # 阶段 3（回写）：情绪观察独立于记忆；模块缺席时按 None 降级。
+        self.emotion: Any = None
 
         self._started_at = int(time.time())
         self._boot_errors: list[str] = []
@@ -131,6 +133,7 @@ class ConglingPlugin(Star):
         await self._safe_boot("persona", self._boot_persona)
         await self._safe_boot("humanize", self._boot_humanize)
         await self._safe_boot("memory", self._boot_memory)
+        await self._safe_boot("emotion", self._boot_emotion)
         await self._safe_boot("diary", self._boot_diary)
         await self._safe_boot("proactive", self._boot_proactive)
         await self._safe_boot("night", self._boot_night)
@@ -155,6 +158,7 @@ class ConglingPlugin(Star):
         try:
             self.spawn_background(self._housekeeping())
             self.spawn_background(self._beat_loop())
+            self.spawn_background(self._emotion_loop())
             self.spawn_background(self._qzone_daily_loop())
             if self.night is not None:
                 self.spawn_background(self._dream_loop())
@@ -173,6 +177,11 @@ class ConglingPlugin(Star):
                 await self.memory.flush()
         except Exception as exc:
             logger.warning(f"[congling] 记忆落盘失败: {exc!r}")
+        try:
+            if self.emotion is not None:
+                await self.emotion.close()
+        except Exception:
+            pass
         try:
             if self.night is not None:
                 await self.night.shutdown()
@@ -235,6 +244,13 @@ class ConglingPlugin(Star):
             await self.lm_bridge.start()
         except Exception as exc:
             logger.warning(f"[congling] livingmemory 镜像桥启动失败: {exc_brief(exc)}")
+
+    async def _boot_emotion(self) -> None:
+        """阶段 3（回写）：情绪观察。关闭时模块仍装配，面板可读但采样直接跳过。"""
+        from .memory.emotion import EmotionService
+
+        self.emotion = EmotionService(self)
+        await self.emotion.start()
 
     async def _boot_night(self) -> None:
         # 长夜如梦没开、但收线静默开着时也要装起来：这时只有「说晚安就停」这一件事生效
@@ -308,6 +324,9 @@ class ConglingPlugin(Star):
                     await self.memory.daily_tick()
                 if self.diary is not None:
                     await self.diary.tick()
+                # 阶段 3（回写）：按保留天数清情绪事件（只清过期，不动当前状态）。
+                if self.emotion is not None:
+                    await self.emotion.purge()
                 # 主动找人已挪到 _beat_loop（60 秒一拍），这里不能再调一次
                 await self.decision.purge()
                 await self._purge_cache()
@@ -346,6 +365,24 @@ class ConglingPlugin(Star):
                 except Exception as exc:
                     logger.warning(f"[congling] {name}心跳出错: {exc!r}")
             await asyncio.sleep(interval)
+
+    async def _emotion_loop(self) -> None:
+        """阶段 3（回写）：情绪采样心跳。
+
+        独立于 night.beat_enabled，避免关闭作息心跳后情绪观察一起停摆；
+        采样间隔与每日上限都在 EmotionService.tick 内部节流。
+        """
+        if self.emotion is None:
+            return
+        await asyncio.sleep(45)  # 避开启动时的插件竞争
+        while True:
+            try:
+                await self.emotion.tick()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.debug(f"[congling] 情绪心跳出错: {exc!r}")
+            await asyncio.sleep(60)
 
     async def _dream_loop(self) -> None:
         """每 5 分钟看一次该不该做梦。比整点轮询细，开销可以忽略。"""
@@ -865,6 +902,7 @@ class ConglingPlugin(Star):
                 "perception": self.perception is not None,
                 "persona": self.persona is not None,
                 "memory": self.memory is not None,
+                "emotion": self.emotion is not None,
                 "night": self.night is not None,
                 "capability": self.capabilities is not None,
                 "models": self.models is not None,

@@ -326,6 +326,13 @@ class PersonaService:
         state = await self._state_line(event)
         if state:
             dynamic.append(state)
+        # 阶段 3（回写）：当前情绪只取未过期的一条；observe_only 时这里返回空，不参与回复。
+        try:
+            emotion_line = await self.plugin.emotion.prompt_line(event)
+        except Exception:
+            emotion_line = ""
+        if emotion_line:
+            dynamic.append(emotion_line)
         scene = self._scene_line(event)
         if scene:
             dynamic.append(scene)

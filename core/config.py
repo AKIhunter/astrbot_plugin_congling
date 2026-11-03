@@ -176,6 +176,27 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # 醒后补课 L3 分流：是否耦合 at_guard。true=交 at_guard 打分，false=用 congling 自己的回复阈值
         "at_guard_coupled": False,
     },
+    # 阶段 3（回写）：情绪观察。首周默认 observe_only，只记录不注入回复。
+    "emotion": {
+        "observe": {
+            "enabled": True,
+            "mode": "observe_only",
+            "sample_interval_minutes": 30,
+            "min_messages": 5,
+            "window_minutes": 60,
+            "state_ttl_minutes": 120,
+            "retention_days": 30,
+            "max_events_per_day": 200,
+            "write_pattern_to_memory": True,
+            "panel_curve": True,
+        },
+        "bili": {
+            # 首周双读：BiliBot 本地好感继续写，同时把情绪事件上报给从绫。
+            "read_mode": "dual_read",
+            "write_local": True,
+            "reconcile_warn_threshold": 15,
+        },
+    },
     "night": {
         "enabled": False,
         "allow_sleep": True,
