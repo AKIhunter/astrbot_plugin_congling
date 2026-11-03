@@ -42,6 +42,8 @@ TEXT_PROMPT = """现在没人跟你说话，你想主动找对方说一句。
 2. 不许客套，不许「在吗」「有什么可以帮你」「需要我做什么」
 3. 可以点具体的事（只能是上面材料里有的），不许编造
 4. 只输出这句话本身，不要引号，不要解释
+5. 材料里写着「我」的是你自己说过的话，写着「对方」的就是正在跟你说话的那个人，跟他说话一律用「你」
+6. 绝对不许拿任何人的昵称当第三人称主语去转述，像「望山一早发了好几条」「某某说…」这种一律不行，也不要把自己写成第三人称
 """
 
 
@@ -347,13 +349,20 @@ class Proactive:
                 "ORDER BY ts DESC LIMIT 6",
                 (session_id,),
             )
+            is_group = str(row.get("session_kind") or "") == "group"
             for item in reversed(recent):
-                who = str(item.get("sender_name") or "对方")
-                if str(item.get("sender_id") or "") == "bot":
-                    who = f"你自己（{identity['name']}）"
                 what = str(item.get("text") or "").strip()
-                if what:
-                    materials.append(f"- {who}：{what[:120]}")
+                if not what:
+                    continue
+                # 素材里的主语必须分成「我」和「对方」两种：直接写昵称会让模型
+                # 把昵称当第三人称转述，写出「望山一早发了好几条…」「绫说…」这种怪句子
+                if str(item.get("sender_id") or "") == "bot":
+                    who = "我"
+                elif is_group:
+                    who = str(item.get("sender_name") or "对方")
+                else:
+                    who = "对方"
+                materials.append(f"- {who}：{what[:120]}")
         except Exception as exc:
             logger.warning(f"[congling] 读取主动聊天素材失败: {exc_brief(exc)}")
         try:
@@ -479,6 +488,7 @@ class Proactive:
         """同一通道发送醒后阶段和主动正文；每段发送前检查当前作息与人格。"""
         from astrbot.api.event import MessageChain
         from astrbot.api.message_components import Plain
+        from ..core.reply_mentions import MentionReply
 
         umo = self._umo_of(row)
         session_id = str(row["session_id"])
@@ -486,7 +496,9 @@ class Proactive:
         epoch = epoch if epoch is not None else (await night.wake_flow.epoch() if night else None)
         # 醒后阶段不能截断补课文本；正文仍沿用原分句上限。
         composer = getattr(self.plugin, "composer", None)
-        parts = composer.split(text, str(row.get("session_kind") or "private")) if composer else [text]
+        # 补答与真实 @ 同条发送，避免分句截断来源占位符；主动正文仍沿用原上限。
+        parts = ([text] if phase == "reply" or composer is None else
+                 composer.split(text, str(row.get("session_kind") or "private")))
         parts = [p for p in parts if p.strip()]
         if phase == "proactive":
             parts = parts[:3]
@@ -510,14 +522,24 @@ class Proactive:
                     if latest != activity:
                         raise RuntimeError("会话收到新消息，撤销旧主动文本")
                 # 超时不能证明未发送；不盲重试，避免同一句重复出现。
-                result = await self.plugin.context.send_message(umo, MessageChain([Plain(text=part)]))
+                chain = [Plain(text=part)]
+                archived = str(part)
+                if isinstance(text, MentionReply):
+                    archived = text.readable(str(part))
+                    if phase == "reply" and text.mentions and str(row.get("session_kind") or "") == "group":
+                        from astrbot.api.message_components import At
+                        chain = [At(qq=value) if kind == "at" else Plain(text=value)
+                                 for kind, value in text.segments(str(part))]
+                    else:
+                        chain = [Plain(text=archived)]
+                result = await self.plugin.context.send_message(umo, MessageChain(chain))
                 if result is False or (isinstance(result, dict) and (
                     result.get("ok") is False or result.get("success") is False
                     or result.get("status") == "failed" or result.get("retcode", 0) not in (0, "0")
                 )):
                     raise RuntimeError("平台未确认发送成功")
-                sent.append(part)
-                await self._archive(session_id, umo, part, str(row.get("session_kind") or "private"),
+                sent.append(archived)
+                await self._archive(session_id, umo, archived, str(row.get("session_kind") or "private"),
                                     identity=identity, phase=phase)
         finally:
             # 中途取消/失败也保留已经成功发送的片段，沿用新版自述证据规则。
@@ -541,7 +563,7 @@ class Proactive:
             platform = umo.split(":", 1)[0] if ":" in umo else ""
             await self.store.execute(
                 "INSERT INTO msg_archive(msg_id, session_id, session_kind, sender_id, sender_name, ts, text, "
-                "blocks_json, expanded, umo, platform) VALUES(?,?,?,?,?,?,?,?,0,?,?)",
+                "blocks_json, expanded, umo, platform, handled) VALUES(?,?,?,?,?,?,?,?,0,?,?,1)",
                 (
                     f"{phase}-{time.time_ns()}",
                     session_id,

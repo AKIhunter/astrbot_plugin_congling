@@ -1,4 +1,4 @@
-"""1.1.0 适配中的可选桥隔离、发送确认和清除闸门；只使用离线替身。"""
+"""1.1.1 适配中的可选桥隔离、发送确认和清除闸门；只使用离线替身。"""
 import asyncio
 import sys
 import unittest
@@ -13,11 +13,48 @@ from astrbot_plugin_congling.core.contracts import MemoryDraft
 from astrbot_plugin_congling.memory.bridge_livingmemory import LivingMemoryBridge
 from astrbot_plugin_congling.qqext.qzone import QzoneBridge
 from astrbot_plugin_congling.night import NightModule
+from astrbot_plugin_congling.night.rollup import RollupChunk
 
 
 class Adaptation(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = base.Regression.asyncSetUp
     asyncTearDown = base.Regression.asyncTearDown
+
+    def test_message_id_supports_method_and_onebot_message_object(self):
+        from astrbot_plugin_congling.main import _congling_msg_id
+        self.assertEqual(_congling_msg_id(SimpleNamespace(get_message_id=lambda: 123)), "123")
+        self.assertEqual(_congling_msg_id(SimpleNamespace(
+            message_obj=SimpleNamespace(message_id=456))), "456")
+        self.assertEqual(_congling_msg_id(SimpleNamespace()), "")
+        def broken():
+            raise AttributeError("旧事件接口")
+        self.assertEqual(_congling_msg_id(SimpleNamespace(
+            get_message_id=broken, message_obj=SimpleNamespace(message_id=789))), "789")
+
+    async def test_message_id_used_before_wake_and_after_reply_without_getter(self):
+        plugin = base.ConglingPlugin.__new__(base.ConglingPlugin)
+        plugin.enabled_for = lambda event: True
+        plugin.is_admin = lambda event: False
+        plugin.persona = SimpleNamespace(resolve=AsyncMock(return_value={"token": "A"}),
+                                         inject=AsyncMock())
+        plugin.proactive = SimpleNamespace(send_stage=AsyncMock())
+        plugin.night = SimpleNamespace(
+            state=SimpleNamespace(state=SimpleNamespace(is_asleep=lambda: False)),
+            wake_flow=SimpleNamespace(prepare=AsyncMock()),
+            prompt_hint=lambda **kwargs: "",
+            after_reply=AsyncMock(),
+        )
+        plugin.store = self.store
+        plugin.qqext = plugin.diary = plugin.capabilities = plugin.memory = None
+        event = SimpleNamespace(
+            message_obj=SimpleNamespace(message_id=456), unified_msg_origin="qq:GroupMessage:A",
+            get_group_id=lambda: "A", get_sender_id=lambda: "U",
+            set_extra=lambda *args: None, stop_event=lambda: self.fail("不能因接口缺失静默"),
+        )
+        await plugin.persona_hook(event, SimpleNamespace())
+        self.assertEqual(plugin.night.wake_flow.prepare.await_args.kwargs["exclude_msg_id"], "456")
+        await plugin.after_sent_hook(event)
+        plugin.night.after_reply.assert_awaited_once_with(None, session_id="A", msg_id="456")
 
     def bridge(self, enabled=True):
         self.cfg.override("bridge_livingmemory.enabled", enabled)
@@ -103,6 +140,10 @@ class Adaptation(unittest.IsolatedAsyncioTestCase):
         night = self.p.night = NightModule(self.p)
         now = 1793500000
         night.state.state.last_wake_at = now
+        night.crawler.pending = AsyncMock(return_value=[
+            {"id": 1, "msg_id": "history", "session_id": "A", "ts": now - 5, "text": "历史"}])
+        night.rollup.rollup_session = AsyncMock(return_value=[
+            RollupChunk(chunk_end_id=1, summary="背景")])
         await self.store.kv_set("night.last_sleep_window",
                                 [{"sleep_at": now - 10, "wake_at": now, "kind": "night"}])
         night.crawler.mark_read = AsyncMock()
