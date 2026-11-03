@@ -18,6 +18,7 @@ from astrbot.api.web import request
 
 from ..core import paths
 from ..core.memory_guard import memory_work
+from .bindings import BindingMixin
 from .diary import DiaryMixin
 from .emotion import EmotionMixin
 from .memory_m3 import MemoryM3Mixin
@@ -228,7 +229,7 @@ def _schema_groups(config: Any) -> list[dict[str, Any]]:
     return groups
 
 
-class PageApi(MemoryResetMixin, ProactiveMixin, DiaryMixin, MemoryM3Mixin, MemoryV2Mixin, EmotionMixin):
+class PageApi(MemoryResetMixin, ProactiveMixin, DiaryMixin, MemoryM3Mixin, MemoryV2Mixin, EmotionMixin, BindingMixin):
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
         self.cfg = plugin.cfg
@@ -358,6 +359,19 @@ class PageApi(MemoryResetMixin, ProactiveMixin, DiaryMixin, MemoryM3Mixin, Memor
             ("/emotion/state/clear", self.emotion_state_clear, ["POST"]),
             ("/emotion/ingest", self.emotion_ingest, ["POST"]),
             ("/emotion/state", self.emotion_state, ["GET"]),
+            # ---- 阶段 3：绑定管理（只在从绫页面使用，不接 Bot Manager）
+            ("/bindings/overview", self.bindings_overview, ["GET"]),
+            ("/bindings/list", self.bindings_list, ["GET"]),
+            ("/bindings/preview", self.bindings_preview, ["GET"]),
+            ("/bindings/revoke", self.bindings_revoke, ["POST"]),
+            ("/bindings/rollback", self.bindings_rollback, ["POST"]),
+            ("/bindings/audit", self.bindings_audit, ["GET"]),
+            ("/bindings/candidates", self.bindings_candidates, ["GET"]),
+            ("/bindings/candidates/review", self.bindings_candidates_review, ["POST"]),
+            ("/bindings/settings", self.bindings_settings, ["GET"]),
+            ("/bindings/settings/save", self.bindings_settings_save, ["POST"]),
+            ("/bindings/upload/preview", self.bindings_upload_preview, ["POST"]),
+            ("/bindings/upload", self.bindings_upload, ["POST"]),
             # ---- 0.5.0 头像
             ("/avatar", self.avatar_state, ["GET"]),
             ("/avatar/set", self.avatar_set, ["POST"]),

@@ -981,6 +981,7 @@ const VIEWS = {
   behavior: { title: "行为", render: renderBehavior },
   memory: { title: "记忆", render: renderMemory },
   emotion: { title: "情绪与关系", render: renderEmotion },
+  bindings: { title: "绑定管理", render: renderBindings },
   night: { title: "长夜", render: renderNight },
   diary: { title: "日记", render: renderDiary },
   tools: { title: "工具", render: renderTools },
@@ -1199,6 +1200,7 @@ const CORE_KEYS = {
   basic: ["enabled", "enable_private", "enable_group", "platforms"],
   persona: ["active_hours", "version_history_limit"],
   humanize: ["reply_threshold", "max_bubbles_private", "max_bubbles_group", "think_delay_base", "quote_probability"],
+  reply_decision: ["reply_decision_enabled", "reply_decision_source", "reply_threshold", "reply_window_seconds"],
   guard: ["strip_emoji", "strip_trailing_period", "max_chars_per_bubble"],
   perception: ["expand_forward", "image_describe", "voice_transcribe"],
   memory: ["enabled", "inject_top_k", "forgetting.mode", "levels.enabled", "affinity.enabled", "user_profile.enabled"],
@@ -1216,6 +1218,16 @@ async function loadSettings(force) {
 
 function pickGroup(data, name) {
   return (data.groups || []).find((group) => group.name === name) || null;
+}
+
+function behaviorGroups(settings) {
+  const group = pickGroup(settings, "humanize");
+  if (!group) return { decision: null, expression: null };
+  const keys = CORE_KEYS.reply_decision;
+  return {
+    decision: { ...group, name: "reply_decision", items: group.items.filter(item => keys.includes(item.key)) },
+    expression: { ...group, items: group.items.filter(item => !keys.includes(item.key)) },
+  };
 }
 
 function controlHtml(item) {
@@ -1994,11 +2006,16 @@ function modeCard(id, title, desc, current) {
 async function renderBehavior() {
   if (isNightUI() && typeof njBehavior === "function") return njBehavior();
   const settings = await loadSettings();
+  const behavior = behaviorGroups(settings);
   view.innerHTML = `
     <div class="settings-intro">这里决定「它怎么说话」和「它看得懂什么」。改完点各卡片自己的保存。</div>
-    ${configCard(pickGroup(settings, "humanize"), {
+    ${configCard(behavior.decision, {
       title: "什么情况下回",
-      desc: "阈值越高越少接话；分句条数决定它一次发几条",
+      desc: "爬楼历史筛选可关闭或交给 at_guard；普通消息由入口门禁判断",
+    })}
+    ${configCard(behavior.expression, {
+      title: "怎么分条和等待",
+      desc: "at_guard 开启分句或犹豫接管时，从绫的这套发送节奏让位",
     })}
     ${configCard(pickGroup(settings, "guard"), {
       title: "输出风格",
@@ -2406,6 +2423,485 @@ async function renderEmotion() {
       if (msg) msg.textContent = err.message;
     }
   };
+}
+
+
+/* ------------------------------------------------------------------ 绑定管理 */
+/* 数据都在 LivingMemory：person_binding（正式绑定）、binding_candidate（自动识别待审）、
+   binding_audit（只追加审计）。这里只做展示和操作，不另存一份。
+   自动识别默认必须逐条审核；后台上传/手改免审但强制留审计。 */
+const bindingFilter = { person_id: "", platform: "", status: "" };
+const bindingOps = { operator: "", reviewer: "", reason: "" };
+/* 上传草稿要跨重绘保留：预览拿到令牌后，执行时必须用同一份内容 */
+const bindingUpload = { content: "", filename: "", mode: "merge", preview: null };
+
+function bindingStatusCN(status) {
+  return {
+    active: "生效",
+    revoked: "已撤销",
+    superseded: "已被替换",
+    pending: "待审核",
+    approved: "已通过",
+    rejected: "已驳回",
+  }[status] || status || "—";
+}
+
+function bindingAuditActionCN(action) {
+  return {
+    create: "新增",
+    update: "更新",
+    revoke: "撤销",
+    rollback: "回滚",
+    upload: "上传",
+    review: "审核",
+    config: "设置",
+  }[action] || action || "—";
+}
+
+async function renderBindings() {
+  const [overview, listed, candidates, audit, settings] = await Promise.all([
+    get("page/bindings/overview"),
+    get("page/bindings/list", {
+      person_id: bindingFilter.person_id,
+      platform: bindingFilter.platform,
+      status: bindingFilter.status,
+    }),
+    get("page/bindings/candidates", { status: "pending", limit: 100 }),
+    get("page/bindings/audit", { limit: 50 }),
+    get("page/bindings/settings"),
+  ]);
+
+  const items = listed.items || [];
+  const platforms = overview.platforms || [];
+
+  const bindingRows = items.length
+    ? `<div class="plain-list">${items.map((row) => `<div class="atom-row" style="align-items:flex-start;gap:12px">
+        <div class="grow">
+          <div class="atom-text">${esc(row.person_id || "—")}${row.display_name ? ` · ${esc(row.display_name)}` : ""}</div>
+          <div class="hint">${esc(row.platform || "")}:${esc(row.account_id || "")} · ${bindingStatusCN(row.status)} · v${esc(row.version || 0)}
+            · 来源 ${esc(row.source || "manual")}</div>
+          <div class="hint">依据 ${esc(row.evidence_type || "—")}${row.evidence_ref ? ` / ${esc(row.evidence_ref)}` : ""}
+            ${row.note ? ` · 备注 ${esc(row.note)}` : ""}</div>
+          <div class="hint">生效 ${fmtTime(row.valid_from)}${row.valid_to ? ` · 失效 ${fmtTime(row.valid_to)}` : ""}</div>
+          <div class="hint">${esc(row.binding_id || "")}</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <button class="ghost" data-bind-revoke="${esc(row.binding_id)}" ${row.status === "active" ? "" : "disabled"}>撤销</button>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="number" min="1" step="1" value="${esc(Math.max(1, Number(row.version || 1) - 1))}"
+              data-bind-version="${esc(row.binding_id)}" style="width:64px" title="回滚到哪个版本" />
+            <button class="ghost" data-bind-rollback="${esc(row.binding_id)}" ${Number(row.version || 0) <= 1 ? "disabled" : ""}>回滚</button>
+          </div>
+        </div>
+      </div>`).join("")}</div>`
+    : `<p class="hint">这个筛选条件下没有绑定。${overview.active_count ? `当前共有 ${overview.active_count} 条生效绑定。` : "还没有任何绑定。"}</p>`;
+
+  const candidateRows = (candidates.items || []).length
+    ? `<div class="plain-list">${candidates.items.map((row) => `<div class="atom-row" style="align-items:flex-start;gap:12px">
+        <div class="grow">
+          <div class="atom-text">${esc(row.person_id || "—")}${row.display_name ? ` · ${esc(row.display_name)}` : ""}</div>
+          <div class="hint">${esc(row.platform || "")}:${esc(row.account_id || "")} · 来源 ${esc(row.source || "auto")}
+            · 提交 ${esc(row.submitted_by || "—")} · ${fmtTime(row.created_at)}</div>
+          <div class="hint">依据 ${esc(row.evidence_type || "—")}${row.evidence_ref ? ` / ${esc(row.evidence_ref)}` : ""}</div>
+        </div>
+        <div style="display:flex;gap:6px">
+          <button class="primary" data-bind-approve="${esc(row.candidate_id)}">通过</button>
+          <button class="ghost" data-bind-reject="${esc(row.candidate_id)}">驳回</button>
+        </div>
+      </div>`).join("")}</div>`
+    : `<p class="hint">没有待审核的自动识别候选。</p>`;
+
+  const auditRows = (audit.items || []).length
+    ? `<div class="plain-list">${audit.items.map((row) => `<div class="atom-row" style="align-items:flex-start">
+        <div class="grow">
+          <div class="atom-text">${bindingAuditActionCN(row.action)} · ${esc(row.operator_name || row.operator_id || "—")}</div>
+          <div class="hint">${fmtTime(row.created_at)} · 渠道 ${esc(row.channel || "—")}
+            ${row.reviewer_id ? ` · 审核 ${esc(row.reviewer_id)}` : ""}</div>
+          <div class="hint">依据：${esc(row.reason || "—")}</div>
+          <div class="hint">${esc(row.binding_id || "配置变更")}${row.binding_id ? ` · v${esc(row.version || 0)}` : ""}
+            ${row.file_hash ? ` · 文件哈希 ${esc(row.file_hash)}` : ""}</div>
+          ${row.evidence_ref ? `<div class="hint">证据：${esc(row.evidence_type || "")} ${esc(row.evidence_ref)}</div>` : ""}
+        </div>
+      </div>`).join("")}</div>`
+    : `<p class="hint">还没有审计记录。</p>`;
+
+  view.innerHTML = `
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>绑定概览</h3><p>一个账号只对应一个人物；自动识别先进候选队列，默认逐条人工审核</p></div>
+      <div class="pad">
+        <div class="grid-stats">
+          <div class="stat"><span class="stat-label">生效绑定</span><span class="stat-num">${overview.active_count || 0}</span></div>
+          <div class="stat"><span class="stat-label">待审核</span><span class="stat-num">${overview.pending_count || 0}</span></div>
+          <div class="stat"><span class="stat-label">人物</span><span class="stat-num">${overview.person_count || 0}</span></div>
+          <div class="stat"><span class="stat-label">平台</span><span class="stat-num">${platforms.length}</span></div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <div class="field"><label>操作人（撤销 / 回滚 / 上传必填）</label>
+            <input type="text" id="bind-operator" value="${esc(bindingOps.operator)}" placeholder="谁做的这次变更" /></div>
+          <div class="field"><label>审核人（可选）</label>
+            <input type="text" id="bind-reviewer" value="${esc(bindingOps.reviewer)}" placeholder="复核的人" /></div>
+          <div class="field"><label>依据（撤销 / 回滚 / 上传必填）</label>
+            <input type="text" id="bind-reason" value="${esc(bindingOps.reason)}" placeholder="为什么这么改" /></div>
+        </div>
+        <div class="hint" style="margin-top:8px">平台：${platforms.length ? platforms.map((p) => esc(p)).join(" / ") : "—"}</div>
+      </div>
+    </section>
+
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>绑定列表</h3><p>按人物 / 平台 / 状态筛选；撤销是软失效，回滚会新建一版并留审计</p></div>
+      <div class="pad">
+        <div class="row">
+          <div class="field"><label>人物</label><input type="text" id="bind-person" value="${esc(bindingFilter.person_id)}" placeholder="person_id" /></div>
+          <div class="field"><label>平台</label><input type="text" id="bind-platform" list="bind-platform-list" value="${esc(bindingFilter.platform)}" placeholder="qq / bilibili …" />
+            <datalist id="bind-platform-list">${platforms.map((p) => `<option value="${esc(p)}"></option>`).join("")}</datalist></div>
+          <div class="field"><label>状态</label><select id="bind-status">
+            ${[["", "仅生效"], ["all", "全部"], ["revoked", "已撤销"], ["superseded", "已被替换"]].map(([value, label]) => `<option value="${value}" ${bindingFilter.status === value ? "selected" : ""}>${label}</option>`).join("")}
+          </select></div>
+        </div>
+        <div class="row" style="margin:10px 0 12px">
+          <button class="ghost" id="bind-filter">筛选</button>
+          <button class="ghost" id="bind-filter-reset">重置</button>
+          <span class="hint" style="align-self:center">共 ${items.length} 条</span>
+        </div>
+        ${bindingRows}
+      </div>
+    </section>
+
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>自动识别待审核</h3><p>通过后才写正式绑定；驳回只改候选状态。两种都会写审计</p></div>
+      <div class="pad">
+        <div class="hint" style="margin-bottom:10px">审核人：${esc(bindingOps.reviewer || "请在上方填写")} · 依据：${esc(bindingOps.reason || "请在上方填写")}</div>
+        ${candidateRows}
+      </div>
+    </section>
+
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>变更预览</h3><p>只读：影响多少条记忆、涉及哪些场景、前 10 条样本；不改任何数据</p></div>
+      <div class="pad">
+        <div class="row">
+          <div class="field"><label>来源账号</label><input type="text" id="bind-preview-account" placeholder="如 qq:123456" /></div>
+          <div class="field"><label>或人物</label><input type="text" id="bind-preview-person" placeholder="person_id" /></div>
+          <button class="ghost" id="bind-preview-go" style="align-self:flex-end;margin-bottom:18px">预览影响</button>
+        </div>
+        <div id="bind-preview-result"><p class="hint">填来源账号或人物后点「预览影响」。</p></div>
+      </div>
+    </section>
+
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>上传绑定文件</h3><p>支持 JSON 数组 / {rows:[]} / {bindings:[]} 与 CSV、TSV；默认 merge，replace 必须先预览确认</p></div>
+      <div class="pad">
+        <div class="row">
+          <div class="field"><label>文件</label><input type="file" id="bind-file" accept=".json,.csv,.tsv,.txt" /></div>
+          <div class="field"><label>模式</label><select id="bind-mode">
+            <option value="merge" ${bindingUpload.mode === "merge" ? "selected" : ""}>merge（只增改，不撤销）</option>
+            <option value="replace" ${bindingUpload.mode === "replace" ? "selected" : ""}>replace（撤销文件里没有的绑定）</option>
+          </select></div>
+        </div>
+        <div class="field"><label>或直接粘贴内容</label>
+          <textarea id="bind-content" rows="6" placeholder='[{"person_id":"p1","platform":"qq","account_id":"123456","display_name":"小绫"}]'>${esc(bindingUpload.content)}</textarea></div>
+        <div class="row" style="margin:10px 0">
+          <button class="ghost" id="bind-upload-preview">预览</button>
+          <button class="primary" id="bind-upload-go">执行上传</button>
+          <label class="switch" style="align-self:center"><input type="checkbox" id="bind-preview-confirmed" /> replace 已确认预览</label>
+        </div>
+        <div id="bind-upload-result">${bindingUpload.preview ? bindingUploadResultHtml(bindingUpload.preview) : '<p class="hint">先点「预览」，看清楚新增 / 更新 / 冲突 / 将撤销多少条，再执行。</p>'}</div>
+      </div>
+    </section>
+
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>自动审核开关</h3><p>${esc(settings.risk_notice || "")}</p></div>
+      <div class="pad">
+        <div class="row">
+          <div class="field"><label>auto_approve</label>
+            <label class="switch"><input type="checkbox" id="bind-auto" ${settings.auto_approve ? "checked" : ""} /> 开启</label></div>
+          <div class="field"><label>理由（开启必填）</label>
+            <input type="text" id="bind-auto-reason" value="${esc(settings.auto_approve_reason || "")}" /></div>
+          <div class="field"><label>风险确认</label>
+            <label class="switch"><input type="checkbox" id="bind-auto-risk" /> 我已了解风险</label></div>
+        </div>
+        <div class="hint" style="margin-top:8px">最后修改：${esc(settings.updated_by || "—")} · ${fmtTime(settings.updated_at)}</div>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="bind-auto-save">保存开关</button>
+          <span class="hint" id="bind-auto-msg" style="align-self:center"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>审计记录</h3><p>最近 50 条：操作人、依据、审核人、文件哈希；只追加，不可改</p></div>
+      <div class="pad">${auditRows}</div>
+    </section>`;
+
+  const readOps = () => {
+    bindingOps.operator = (document.getElementById("bind-operator") || {}).value || "";
+    bindingOps.reviewer = (document.getElementById("bind-reviewer") || {}).value || "";
+    bindingOps.reason = (document.getElementById("bind-reason") || {}).value || "";
+  };
+  const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
+
+  bind("bind-filter", () => {
+    bindingFilter.person_id = (document.getElementById("bind-person") || {}).value || "";
+    bindingFilter.platform = (document.getElementById("bind-platform") || {}).value || "";
+    bindingFilter.status = (document.getElementById("bind-status") || {}).value || "";
+    render();
+  });
+  bind("bind-filter-reset", () => {
+    bindingFilter.person_id = "";
+    bindingFilter.platform = "";
+    bindingFilter.status = "";
+    render();
+  });
+
+  document.querySelectorAll("[data-bind-revoke]").forEach((btn) => {
+    btn.onclick = async () => {
+      readOps();
+      if (!bindingOps.operator || !bindingOps.reason) {
+        askToast("撤销要填操作人和依据", "err");
+        return;
+      }
+      if (!(await askConfirm(`撤销这条绑定？会软失效并写审计，历史版本仍可回滚。`, { ok: "撤销" }))) return;
+      try {
+        await post("page/bindings/revoke", {
+          binding_id: btn.dataset.bindRevoke,
+          operator: bindingOps.operator,
+          reviewer: bindingOps.reviewer,
+          reason: bindingOps.reason,
+        });
+        askToast("已撤销", "ok");
+        render();
+      } catch (err) { askToast(err.message, "err"); }
+    };
+  });
+  document.querySelectorAll("[data-bind-rollback]").forEach((btn) => {
+    btn.onclick = async () => {
+      readOps();
+      if (!bindingOps.operator || !bindingOps.reason) {
+        askToast("回滚要填操作人和依据", "err");
+        return;
+      }
+      const bindingId = btn.dataset.bindRollback;
+      const versionInput = document.querySelector(`[data-bind-version="${bindingId}"]`);
+      const toVersion = Number(versionInput ? versionInput.value : 0);
+      if (!toVersion) { askToast("请填写要回到的版本号", "err"); return; }
+      if (!(await askConfirm(`回滚到 v${toVersion}？会新建一版生效绑定，原记录保留。`, { ok: "回滚" }))) return;
+      try {
+        await post("page/bindings/rollback", {
+          binding_id: bindingId,
+          to_version: toVersion,
+          operator: bindingOps.operator,
+          reviewer: bindingOps.reviewer,
+          reason: bindingOps.reason,
+        });
+        askToast("已回滚", "ok");
+        render();
+      } catch (err) { askToast(err.message, "err"); }
+    };
+  });
+
+  const review = async (candidateId, approve) => {
+    readOps();
+    if (!bindingOps.reviewer || !bindingOps.reason) {
+      askToast("审核要填审核人和依据（可复用上方输入）", "err");
+      return;
+    }
+    if (!(await askConfirm(`${approve ? "通过" : "驳回"}这条候选？`, { ok: approve ? "通过" : "驳回" }))) return;
+    try {
+      await post("page/bindings/candidates/review", {
+        candidate_id: candidateId,
+        approve,
+        reviewer: bindingOps.reviewer,
+        reason: bindingOps.reason,
+      });
+      askToast(approve ? "已通过，正式绑定已写入" : "已驳回", "ok");
+      render();
+    } catch (err) { askToast(err.message, "err"); }
+  };
+  document.querySelectorAll("[data-bind-approve]").forEach((btn) => {
+    btn.onclick = () => review(btn.dataset.bindApprove, true);
+  });
+  document.querySelectorAll("[data-bind-reject]").forEach((btn) => {
+    btn.onclick = () => review(btn.dataset.bindReject, false);
+  });
+
+  bind("bind-preview-go", async (event) => {
+    const box = document.getElementById("bind-preview-result");
+    const sourceAccount = (document.getElementById("bind-preview-account") || {}).value || "";
+    const personId = (document.getElementById("bind-preview-person") || {}).value || "";
+    if (!sourceAccount && !personId) {
+      if (box) box.innerHTML = '<p class="hint">填来源账号或人物后再预览。</p>';
+      return;
+    }
+    event.target.disabled = true;
+    try {
+      const data = await get("page/bindings/preview", { source_account: sourceAccount, person_id: personId, sample_limit: 10 });
+      const audience = Object.entries(data.by_audience || {});
+      if (box) {
+        box.innerHTML = `<p class="hint">影响 ${data.total || 0} 条记忆；只统计带 source_account 的新记录，旧记录不猜归属。</p>
+          ${audience.length ? `<p class="hint">场景分布：${audience.map(([key, count]) => `${esc(key)} ${count}`).join(" / ")}</p>` : ""}
+          ${(data.samples || []).length ? `<div class="plain-list">${data.samples.map((row) => `<div class="atom-row"><div class="grow">
+              <div class="atom-text">${esc(row.content || "")}</div>
+              <div class="hint">#${esc(row.memory_id)} · ${esc(row.audience || "unknown")} · 敏感 ${esc(row.sensitivity || 0)}</div>
+            </div></div>`).join("")}</div>` : '<p class="hint">没有可展示的样本。</p>'}`;
+      }
+    } catch (err) {
+      if (box) box.innerHTML = `<p class="hint">预览失败：${esc(err.message)}</p>`;
+    } finally { event.target.disabled = false; }
+  });
+
+  const readUploadDraft = () => {
+    bindingUpload.content = (document.getElementById("bind-content") || {}).value || "";
+    bindingUpload.mode = (document.getElementById("bind-mode") || {}).value || "merge";
+    readOps();
+  };
+  const fileInput = document.getElementById("bind-file");
+  if (fileInput) {
+    fileInput.onchange = () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const area = document.getElementById("bind-content");
+        if (area) area.value = String(reader.result || "");
+        bindingUpload.filename = file.name || "";
+        askToast("文件已读入，记得先预览", "ok");
+      };
+      reader.onerror = () => askToast("读取文件失败", "err");
+      reader.readAsText(file);
+    };
+  }
+
+  bind("bind-upload-preview", async (event) => {
+    readUploadDraft();
+    const box = document.getElementById("bind-upload-result");
+    if (!bindingUpload.content.trim()) {
+      if (box) box.innerHTML = '<p class="hint">请选择文件或粘贴内容。</p>';
+      return;
+    }
+    event.target.disabled = true;
+    try {
+      const data = await post("page/bindings/upload/preview", {
+        mode: bindingUpload.mode,
+        content: bindingUpload.content,
+        filename: bindingUpload.filename,
+      });
+      bindingUpload.preview = data;
+      bindingUpload.previewContent = bindingUpload.content;
+      if (box) box.innerHTML = bindingUploadResultHtml(data);
+    } catch (err) {
+      bindingUpload.preview = null;
+      if (box) box.innerHTML = `<p class="hint">预览失败：${esc(err.message)}</p>`;
+    } finally { event.target.disabled = false; }
+  });
+
+  bind("bind-upload-go", async () => {
+    readUploadDraft();
+    if (!bindingOps.operator || !bindingOps.reason) {
+      askToast("上传要填操作人和依据", "err");
+      return;
+    }
+    if (!bindingUpload.content.trim()) {
+      askToast("请先选择文件或粘贴内容", "err");
+      return;
+    }
+    if (!bindingUpload.preview) {
+      askToast("请先预览，确认新增 / 更新 / 冲突 / 将撤销数量", "err");
+      return;
+    }
+    if (bindingUpload.previewContent !== bindingUpload.content) {
+      askToast("文件内容变了，请重新预览", "err");
+      return;
+    }
+    const replaceConfirmed = !!(document.getElementById("bind-preview-confirmed") || {}).checked;
+    if (bindingUpload.mode === "replace" && !replaceConfirmed) {
+      askToast("replace 需要先勾选「已确认预览」", "err");
+      return;
+    }
+    if (!(await askConfirm(
+      `按 ${bindingUpload.mode} 上传 ${bindingUpload.preview.rows} 行？` +
+      (bindingUpload.mode === "replace" ? `将撤销 ${bindingUpload.preview.revoke_count || 0} 条未出现的绑定。` : ""),
+      { ok: "上传" }
+    ))) return;
+    try {
+      const result = await post("page/bindings/upload", {
+        mode: bindingUpload.mode,
+        content: bindingUpload.content,
+        filename: bindingUpload.filename,
+        operator: bindingOps.operator,
+        reviewer: bindingOps.reviewer,
+        reason: bindingOps.reason,
+        preview_confirmed: replaceConfirmed,
+        preview_token: bindingUpload.preview.preview_token || "",
+      });
+      askToast(`已上传：新增 ${result.created || 0} / 更新 ${result.updated || 0}`, "ok");
+      bindingUpload.preview = null;
+      bindingUpload.content = "";
+      bindingUpload.filename = "";
+      render();
+    } catch (err) { askToast(err.message, "err"); }
+  });
+
+  bind("bind-auto-save", async () => {
+    readOps();
+    const enabled = !!((document.getElementById("bind-auto") || {}).checked);
+    const reason = (document.getElementById("bind-auto-reason") || {}).value || "";
+    const riskAck = !!((document.getElementById("bind-auto-risk") || {}).checked);
+    const msg = document.getElementById("bind-auto-msg");
+    if (enabled && !reason.trim()) {
+      if (msg) msg.textContent = "开启必须写理由";
+      return;
+    }
+    if (enabled && !riskAck) {
+      if (msg) msg.textContent = "请先勾选「我已了解风险」";
+      return;
+    }
+    if (!bindingOps.operator) {
+      if (msg) msg.textContent = "请填写操作人";
+      return;
+    }
+    try {
+      await post("page/bindings/settings/save", {
+        auto_approve: enabled,
+        reason,
+        operator: bindingOps.operator,
+        reviewer: bindingOps.reviewer,
+        risk_ack: riskAck,
+      });
+      settingsCache = null;
+      if (msg) msg.textContent = "已保存";
+      askToast("设置已保存", "ok");
+    } catch (err) {
+      if (msg) msg.textContent = err.message;
+    }
+  });
+}
+
+/* 上传预览结果的统一渲染（预览和上传后都走这里） */
+function bindingUploadResultHtml(data) {
+  const conflictRows = (data.conflicts || []).length
+    ? `<div class="plain-list">${data.conflicts.map((row) => `<div class="atom-row"><div class="grow">
+        <div class="atom-text">${esc(row.person_id || "—")} · ${esc(row.platform || "")}:${esc(row.account_id || "")}</div>
+        <div class="hint">${esc(row.reason || "冲突")}${row.current_person_id ? `（现绑定：${esc(row.current_person_id)}）` : ""}</div>
+      </div></div>`).join("")}</div>`
+    : '<p class="hint">没有冲突行。</p>';
+  const revokeRows = (data.revoke_items || []).length
+    ? `<div class="plain-list">${data.revoke_items.map((row) => `<div class="atom-row"><div class="grow">
+        <div class="atom-text">${esc(row.person_id || "—")} · ${esc(row.platform || "")}:${esc(row.account_id || "")}</div>
+        <div class="hint">${esc(row.display_name || "")} · ${esc(row.binding_id || "")}</div>
+      </div></div>`).join("")}</div>`
+    : "";
+  return `<div class="grid-stats">
+      <div class="stat"><span class="stat-label">文件行数</span><span class="stat-num">${data.rows || 0}</span></div>
+      <div class="stat"><span class="stat-label">新增</span><span class="stat-num">${data.created || 0}</span></div>
+      <div class="stat"><span class="stat-label">更新</span><span class="stat-num">${data.updated || 0}</span></div>
+      <div class="stat"><span class="stat-label">无变化</span><span class="stat-num">${data.unchanged || 0}</span></div>
+    </div>
+    <p class="hint" style="margin-top:10px">模式 ${esc(data.mode || "")} · 冲突 ${(data.conflicts || []).length} 条
+      · 将撤销 ${data.revoke_count || 0} 条 · 文件哈希 ${esc((data.file_hash || "").slice(0, 16))}…</p>
+    ${(data.errors || []).length ? `<p class="hint">跳过 ${data.errors.length} 行：${esc(data.errors.slice(0, 5).join("；"))}${data.errors.length > 5 ? "…" : ""}</p>` : ""}
+    ${(data.warnings || []).map((item) => `<p class="hint">${esc(item)}</p>`).join("")}
+    <p class="hint" style="margin-top:8px">冲突行不会被覆盖，需人工审。</p>
+    ${conflictRows}
+    ${revokeRows ? `<p class="hint" style="margin-top:8px">replace 将撤销：</p>${revokeRows}` : ""}`;
 }
 
 
