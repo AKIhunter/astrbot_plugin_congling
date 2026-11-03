@@ -76,6 +76,13 @@ def _number(value: Any, default: int, low: int, high: int) -> int:
         return default
 
 
+def _boolean(body: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = body.get(key, default)
+    if type(value) is not bool:
+        raise ValueError(f"{key} 必须是布尔值")
+    return value
+
+
 def _normalize_header(value: Any) -> str:
     return str(value or "").strip().casefold().replace(" ", "").replace("-", "_")
 
@@ -87,6 +94,10 @@ def _canonical_row(raw: dict[str, Any], index: int) -> tuple[dict[str, Any], str
         normalized = _normalize_header(key)
         for target, aliases in _COLUMN_ALIASES.items():
             if normalized in aliases:
+                if target in values:
+                    return {}, f"第 {index} 行有重复列 {target}"
+                if isinstance(value, (dict, list, bool)):
+                    return {}, f"第 {index} 行的 {target} 必须是文本或数字"
                 values[target] = value
                 break
     row = {
@@ -111,15 +122,24 @@ def _parse_csv(content: str) -> tuple[list[dict[str, Any]], list[str]]:
         if candidate in sample:
             delimiter = candidate
             break
-    reader = csv.DictReader(io.StringIO(content), delimiter=delimiter)
+    reader = csv.DictReader(io.StringIO(content), delimiter=delimiter, strict=True)
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
-    for index, raw in enumerate(reader, start=2):
-        row, error = _canonical_row(dict(raw or {}), index)
-        if error:
-            errors.append(error)
-            continue
-        rows.append(row)
+    try:
+        headers = [_normalize_header(value) for value in reader.fieldnames or []]
+        if len(headers) != len(set(headers)):
+            return [], ["CSV 有重复列名"]
+        for index, raw in enumerate(reader, start=2):
+            if None in raw:
+                errors.append(f"第 {index} 行的列数多于表头")
+                continue
+            row, error = _canonical_row(dict(raw or {}), index)
+            if error:
+                errors.append(error)
+                continue
+            rows.append(row)
+    except csv.Error:
+        errors.append("CSV 格式错误，请检查引号和列数")
     return rows, errors
 
 
@@ -136,7 +156,7 @@ def _parse_upload(content: str, filename: str = "") -> tuple[list[dict[str, Any]
         except json.JSONDecodeError as exc:
             return [], [f"JSON 解析失败：{exc}"]
         if isinstance(payload, dict):
-            payload = payload.get("rows") or payload.get("bindings") or payload.get("items") or []
+            payload = next((payload[key] for key in ("rows", "bindings", "items") if key in payload), None)
         if not isinstance(payload, list):
             return [], ["JSON 顶层需要是数组，或包含 rows/bindings 数组"]
         rows: list[dict[str, Any]] = []
@@ -158,16 +178,19 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
 
 
-def _preview_token(rows: list[dict[str, Any]], mode: str, active: list[dict[str, Any]]) -> str:
+def _duplicate_accounts(rows: list[dict[str, Any]]) -> bool:
+    return len({(row["platform"], row["account_id"]) for row in rows}) != len(rows)
+
+
+def _preview_token(
+    rows: list[dict[str, Any]], mode: str, active: list[dict[str, Any]], file_hash: str = "",
+) -> str:
     payload = json.dumps(
         {
             "mode": mode,
+            "file_hash": file_hash,
             "rows": sorted(rows, key=lambda row: (row.get("platform", ""), row.get("account_id", ""))),
-            "active": sorted(
-                (str(item.get("platform") or ""), str(item.get("account_id") or ""),
-                 str(item.get("person_id") or ""), int(item.get("version") or 0))
-                for item in active
-            ),
+            "active": sorted(active, key=lambda item: str(item.get("binding_id") or "")),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -286,6 +309,30 @@ class BindingMixin:
         except Exception as exc:
             return _err(repr(exc)[:200])
 
+    async def bindings_save(self) -> dict[str, Any]:
+        """手动新增/更正：账号保持不变，人物变化由存储层版本化。"""
+        try:
+            lm = self._require_lm()
+            body = await _body()
+            row, error = _canonical_row(body, 1)
+            if error:
+                return _err(error)
+            operator = str(body.get("operator") or "").strip()
+            reason = str(body.get("reason") or "").strip()
+            if not operator or not reason:
+                return _err("请填写操作人和变更依据")
+            expected = body.get("expected_binding", {})
+            if not isinstance(expected, dict):
+                return _err("expected_binding 必须是绑定快照")
+            result = await lm.apply_binding_change(
+                **row, operator=operator, reviewer=str(body.get("reviewer") or "").strip(),
+                reason=reason, channel="page", request_id=uuid4().hex,
+                expected_binding=expected,
+            )
+            return _ok(result)
+        except Exception as exc:
+            return _err(repr(exc)[:200])
+
     async def bindings_rollback(self) -> dict[str, Any]:
         try:
             lm = self._require_lm()
@@ -354,7 +401,7 @@ class BindingMixin:
             if not reason:
                 return _err("请填写审核依据")
             result = await lm.review_binding_candidate(
-                candidate_id, approve=bool(body.get("approve")),
+                candidate_id, approve=_boolean(body, "approve"),
                 reviewer=reviewer, reason=reason, request_id=uuid4().hex,
             )
             if result is None:
@@ -374,19 +421,20 @@ class BindingMixin:
         try:
             lm = self._require_lm()
             body = await _body()
-            enabled = bool(body.get("auto_approve"))
+            enabled = _boolean(body, "auto_approve")
             reason = str(body.get("reason") or "").strip()
             operator = str(body.get("operator") or "").strip()
             if enabled and not reason:
                 return _err("开启 auto_approve 必须写明理由")
-            if enabled and not bool(body.get("risk_ack")):
+            risk_ack = _boolean(body, "risk_ack")
+            if enabled and not risk_ack:
                 return _err("开启 auto_approve 需要先确认风险提示")
             if not operator:
                 return _err("请填写操作人")
             data = await lm.set_binding_auto_approve(
                 enabled, reason=reason, operator=operator,
                 reviewer=str(body.get("reviewer") or "").strip(),
-                risk_ack=bool(body.get("risk_ack")), request_id=uuid4().hex,
+                risk_ack=risk_ack, request_id=uuid4().hex,
             )
             return _ok(data)
         except Exception as exc:
@@ -404,6 +452,9 @@ class BindingMixin:
             rows, errors = _parse_upload(content, str(body.get("filename") or ""))
             if not rows:
                 return _err("没有可用的绑定行" + (f"：{errors[0]}" if errors else ""))
+            duplicate = _duplicate_accounts(rows)
+            if duplicate:
+                errors.append("文件内账号重复，请合并后重新上传")
             active = await lm.list_binding_records(include_history=False)
             active_map = {
                 (str(item.get("platform") or ""), str(item.get("account_id") or "")): item
@@ -425,6 +476,7 @@ class BindingMixin:
                     })
                 elif (
                     str(current.get("display_name") or "") != row["display_name"]
+                    or str(current.get("evidence_type") or "") != row["evidence_type"]
                     or str(current.get("evidence_ref") or "") != row["evidence_ref"]
                     or str(current.get("note") or "") != row["note"]
                 ):
@@ -443,7 +495,8 @@ class BindingMixin:
                     }
                     for key, item in active_map.items() if key not in seen
                 ]
-            token = _preview_token(rows, mode, active)
+            file_hash = _content_hash(content)
+            token = _preview_token(rows, mode, active, file_hash)
             return _ok({
                 "mode": mode,
                 "rows": len(rows),
@@ -454,8 +507,9 @@ class BindingMixin:
                 "revoke_count": len(revoke_items),
                 "revoke_items": revoke_items[:50],
                 "errors": errors,
+                "can_apply": not duplicate and not (mode == "replace" and (errors or conflicts)),
                 "preview_token": token,
-                "file_hash": _content_hash(content),
+                "file_hash": file_hash,
                 "warnings": (
                     ["replace 模式会撤销文件中未出现的现有绑定，请确认预览后再执行"]
                     if mode == "replace" else []
@@ -482,18 +536,23 @@ class BindingMixin:
             rows, errors = _parse_upload(content, str(body.get("filename") or ""))
             if not rows:
                 return _err("没有可用的绑定行" + (f"：{errors[0]}" if errors else ""))
+            if _duplicate_accounts(rows):
+                return _err("文件内账号重复，请合并后重新上传")
+            active = None
             if mode == "replace":
+                if errors:
+                    return _err("replace 含错误行，未执行任何变更：" + errors[0])
                 # replace 必须先预览：用同一份行 + 当前绑定快照校验确认令牌。
-                if not bool(body.get("preview_confirmed")):
+                if not _boolean(body, "preview_confirmed"):
                     return _err("replace 模式需要先预览并确认")
                 active = await lm.list_binding_records(include_history=False)
-                expected = _preview_token(rows, mode, active)
+                expected = _preview_token(rows, mode, active, _content_hash(content))
                 if str(body.get("preview_token") or "") != expected:
                     return _err("预览已过期或文件已变化，请重新预览并确认")
             result = await lm.upload_bindings(
                 rows, mode=mode, file_hash=_content_hash(content),
                 operator=operator, reviewer=reviewer, reason=reason,
-                request_id=uuid4().hex,
+                request_id=uuid4().hex, expected_active=active,
             )
             result["errors"] = errors
             result["mode"] = mode

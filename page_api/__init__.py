@@ -364,6 +364,7 @@ class PageApi(MemoryResetMixin, ProactiveMixin, DiaryMixin, MemoryM3Mixin, Memor
             ("/bindings/list", self.bindings_list, ["GET"]),
             ("/bindings/preview", self.bindings_preview, ["GET"]),
             ("/bindings/revoke", self.bindings_revoke, ["POST"]),
+            ("/bindings/save", self.bindings_save, ["POST"]),
             ("/bindings/rollback", self.bindings_rollback, ["POST"]),
             ("/bindings/audit", self.bindings_audit, ["GET"]),
             ("/bindings/candidates", self.bindings_candidates, ["GET"]),

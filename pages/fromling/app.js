@@ -2466,6 +2466,12 @@ async function renderEmotion() {
    自动识别默认必须逐条审核；后台上传/手改免审但强制留审计。 */
 const bindingFilter = { person_id: "", platform: "", status: "" };
 const bindingOps = { operator: "", reviewer: "", reason: "" };
+const bindingEdit = { expected: {}, values: {} };
+const bindingEditFields = [
+  ["person_id", "人物"], ["platform", "平台"], ["account_id", "账号"],
+  ["display_name", "显示名"], ["evidence_type", "依据类型"],
+  ["evidence_ref", "依据引用"], ["note", "备注"],
+];
 /* 上传草稿要跨重绘保留：预览拿到令牌后，执行时必须用同一份内容 */
 const bindingUpload = { content: "", filename: "", mode: "merge", preview: null };
 
@@ -2484,10 +2490,15 @@ function bindingAuditActionCN(action) {
   return {
     create: "新增",
     update: "更新",
+    merge: "更正人物",
     revoke: "撤销",
     rollback: "回滚",
     upload: "上传",
     review: "审核",
+    candidate_submit: "提交待审",
+    candidate_update: "更新待审",
+    candidate_approve: "审核通过",
+    candidate_reject: "审核驳回",
     config: "设置",
   }[action] || action || "—";
 }
@@ -2520,6 +2531,7 @@ async function renderBindings() {
           <div class="hint">${esc(row.binding_id || "")}</div>
         </div>
         <div style="display:flex;flex-direction:column;gap:6px">
+          <button class="ghost" data-bind-edit="${esc(row.binding_id)}" ${row.status === "active" ? "" : "disabled"}>编辑</button>
           <button class="ghost" data-bind-revoke="${esc(row.binding_id)}" ${row.status === "active" ? "" : "disabled"}>撤销</button>
           <div style="display:flex;gap:6px;align-items:center">
             <input type="number" min="1" step="1" value="${esc(Math.max(1, Number(row.version || 1) - 1))}"
@@ -2570,11 +2582,11 @@ async function renderBindings() {
           <div class="stat"><span class="stat-label">平台</span><span class="stat-num">${platforms.length}</span></div>
         </div>
         <div class="row" style="margin-top:12px">
-          <div class="field"><label>操作人（撤销 / 回滚 / 上传必填）</label>
+          <div class="field"><label>操作人（编辑 / 撤销 / 回滚 / 上传必填）</label>
             <input type="text" id="bind-operator" value="${esc(bindingOps.operator)}" placeholder="谁做的这次变更" /></div>
           <div class="field"><label>审核人（可选）</label>
             <input type="text" id="bind-reviewer" value="${esc(bindingOps.reviewer)}" placeholder="复核的人" /></div>
-          <div class="field"><label>依据（撤销 / 回滚 / 上传必填）</label>
+          <div class="field"><label>依据（编辑 / 撤销 / 回滚 / 上传必填）</label>
             <input type="text" id="bind-reason" value="${esc(bindingOps.reason)}" placeholder="为什么这么改" /></div>
         </div>
         <div class="hint" style="margin-top:8px">平台：${platforms.length ? platforms.map((p) => esc(p)).join(" / ") : "—"}</div>
@@ -2598,6 +2610,21 @@ async function renderBindings() {
           <span class="hint" style="align-self:center">共 ${items.length} 条</span>
         </div>
         ${bindingRows}
+      </div>
+    </section>
+
+    <section class="cfg-group">
+      <div class="cfg-head"><h3>手动新增 / 更正</h3><p>已有绑定请先点列表「编辑」。更正人物会保留旧版本；不修改已有记忆，所有变更留审计</p></div>
+      <div class="pad">
+        <div class="row">
+          ${bindingEditFields.map(([key, label]) => `<div class="field"><label>${label}</label>
+            <input type="text" id="bind-edit-${key}" value="${esc(bindingEdit.values[key] || "")}"
+              ${bindingEdit.expected.binding_id && ["platform", "account_id"].includes(key) ? "readonly" : ""} /></div>`).join("")}
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="ghost" id="bind-edit-new">清空 / 新增</button>
+          <button class="primary" id="bind-edit-save">保存绑定</button>
+        </div>
       </div>
     </section>
 
@@ -2672,6 +2699,48 @@ async function renderBindings() {
     bindingOps.reason = (document.getElementById("bind-reason") || {}).value || "";
   };
   const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
+
+  const fillBindingEdit = (row = {}) => {
+    bindingEdit.expected = { ...row };
+    bindingEdit.values = { ...row };
+    bindingEditFields.forEach(([key]) => {
+      const input = document.getElementById(`bind-edit-${key}`);
+      if (input) {
+        input.value = row[key] || "";
+        input.readOnly = !!row.binding_id && ["platform", "account_id"].includes(key);
+      }
+    });
+  };
+  document.querySelectorAll("[data-bind-edit]").forEach((btn) => {
+    btn.onclick = () => fillBindingEdit(items.find((row) => row.binding_id === btn.dataset.bindEdit));
+  });
+  bindingEditFields.forEach(([key]) => {
+    const input = document.getElementById(`bind-edit-${key}`);
+    if (input) input.oninput = () => { bindingEdit.values[key] = input.value; };
+  });
+  bind("bind-edit-new", () => fillBindingEdit());
+  bind("bind-edit-save", async (event) => {
+    readOps();
+    const values = {};
+    bindingEditFields.forEach(([key]) => {
+      values[key] = ((document.getElementById(`bind-edit-${key}`) || {}).value || "").trim();
+    });
+    if (!values.person_id || !values.platform || !values.account_id || !bindingOps.operator.trim() || !bindingOps.reason.trim()) {
+      askToast("请填写人物、平台、账号、操作人和依据", "err");
+      return;
+    }
+    const payload = { ...values, ...bindingOps, expected_binding: { ...bindingEdit.expected } };
+    event.target.disabled = true;
+    try {
+      if (!(await askConfirm("保存绑定？人物变更会生成新版本，不修改已有记忆。", { ok: "保存" }))) return;
+      await post("page/bindings/save", payload);
+      fillBindingEdit();
+      bindingUpload.preview = null;
+      askToast("绑定已保存", "ok");
+      render();
+    } catch (err) { askToast(err.message, "err"); }
+    finally { event.target.disabled = false; }
+  });
 
   bind("bind-filter", () => {
     bindingFilter.person_id = (document.getElementById("bind-person") || {}).value || "";
@@ -2787,6 +2856,17 @@ async function renderBindings() {
     bindingUpload.mode = (document.getElementById("bind-mode") || {}).value || "merge";
     readOps();
   };
+  const invalidateUploadPreview = () => {
+    bindingUpload.preview = null;
+    const confirmed = document.getElementById("bind-preview-confirmed");
+    if (confirmed) confirmed.checked = false;
+    const result = document.getElementById("bind-upload-result");
+    if (result) result.textContent = "内容或模式已变化，请重新预览。";
+  };
+  const uploadContent = document.getElementById("bind-content");
+  const uploadMode = document.getElementById("bind-mode");
+  if (uploadContent) uploadContent.oninput = () => { readUploadDraft(); invalidateUploadPreview(); };
+  if (uploadMode) uploadMode.onchange = () => { readUploadDraft(); invalidateUploadPreview(); };
   const fileInput = document.getElementById("bind-file");
   if (fileInput) {
     fileInput.onchange = () => {
@@ -2797,6 +2877,8 @@ async function renderBindings() {
         const area = document.getElementById("bind-content");
         if (area) area.value = String(reader.result || "");
         bindingUpload.filename = file.name || "";
+        readUploadDraft();
+        invalidateUploadPreview();
         askToast("文件已读入，记得先预览", "ok");
       };
       reader.onerror = () => askToast("读取文件失败", "err");
@@ -2812,14 +2894,16 @@ async function renderBindings() {
       return;
     }
     event.target.disabled = true;
+    invalidateUploadPreview();
+    const draft = { mode: bindingUpload.mode, content: bindingUpload.content, filename: bindingUpload.filename };
     try {
-      const data = await post("page/bindings/upload/preview", {
-        mode: bindingUpload.mode,
-        content: bindingUpload.content,
-        filename: bindingUpload.filename,
-      });
+      const data = await post("page/bindings/upload/preview", draft);
+      readUploadDraft();
+      if (draft.content !== bindingUpload.content || draft.mode !== bindingUpload.mode || draft.filename !== bindingUpload.filename) return;
       bindingUpload.preview = data;
-      bindingUpload.previewContent = bindingUpload.content;
+      bindingUpload.previewContent = draft.content;
+      bindingUpload.previewMode = draft.mode;
+      bindingUpload.previewFilename = draft.filename;
       if (box) box.innerHTML = bindingUploadResultHtml(data);
     } catch (err) {
       bindingUpload.preview = null;
@@ -2827,7 +2911,7 @@ async function renderBindings() {
     } finally { event.target.disabled = false; }
   });
 
-  bind("bind-upload-go", async () => {
+  bind("bind-upload-go", async (event) => {
     readUploadDraft();
     if (!bindingOps.operator || !bindingOps.reason) {
       askToast("上传要填操作人和依据", "err");
@@ -2841,8 +2925,12 @@ async function renderBindings() {
       askToast("请先预览，确认新增 / 更新 / 冲突 / 将撤销数量", "err");
       return;
     }
-    if (bindingUpload.previewContent !== bindingUpload.content) {
-      askToast("文件内容变了，请重新预览", "err");
+    if (bindingUpload.previewContent !== bindingUpload.content || bindingUpload.previewMode !== bindingUpload.mode || bindingUpload.previewFilename !== bindingUpload.filename) {
+      askToast("文件或模式变了，请重新预览", "err");
+      return;
+    }
+    if (bindingUpload.preview.can_apply === false) {
+      askToast("请先修正预览中的错误或冲突", "err");
       return;
     }
     const replaceConfirmed = !!(document.getElementById("bind-preview-confirmed") || {}).checked;
@@ -2850,28 +2938,24 @@ async function renderBindings() {
       askToast("replace 需要先勾选「已确认预览」", "err");
       return;
     }
-    if (!(await askConfirm(
-      `按 ${bindingUpload.mode} 上传 ${bindingUpload.preview.rows} 行？` +
-      (bindingUpload.mode === "replace" ? `将撤销 ${bindingUpload.preview.revoke_count || 0} 条未出现的绑定。` : ""),
-      { ok: "上传" }
-    ))) return;
+    const payload = {
+      mode: bindingUpload.mode, content: bindingUpload.content, filename: bindingUpload.filename,
+      ...bindingOps, preview_confirmed: replaceConfirmed,
+      preview_token: bindingUpload.preview.preview_token || "",
+    };
+    const confirmText = `按 ${bindingUpload.mode} 上传 ${bindingUpload.preview.rows} 行？` +
+      (bindingUpload.mode === "replace" ? `将撤销 ${bindingUpload.preview.revoke_count || 0} 条未出现的绑定。` : "");
+    event.target.disabled = true;
     try {
-      const result = await post("page/bindings/upload", {
-        mode: bindingUpload.mode,
-        content: bindingUpload.content,
-        filename: bindingUpload.filename,
-        operator: bindingOps.operator,
-        reviewer: bindingOps.reviewer,
-        reason: bindingOps.reason,
-        preview_confirmed: replaceConfirmed,
-        preview_token: bindingUpload.preview.preview_token || "",
-      });
-      askToast(`已上传：新增 ${result.created || 0} / 更新 ${result.updated || 0}`, "ok");
+      if (!(await askConfirm(confirmText, { ok: "上传" }))) return;
+      const result = await post("page/bindings/upload", payload);
+      askToast(`已上传：新增 ${result.created || 0} / 更新 ${result.updated || 0} / 冲突 ${(result.conflicts || []).length} / 错误 ${(result.errors || []).length}`, "ok");
       bindingUpload.preview = null;
       bindingUpload.content = "";
       bindingUpload.filename = "";
       render();
     } catch (err) { askToast(err.message, "err"); }
+    finally { event.target.disabled = false; }
   });
 
   bind("bind-auto-save", async () => {
@@ -2931,9 +3015,10 @@ function bindingUploadResultHtml(data) {
     </div>
     <p class="hint" style="margin-top:10px">模式 ${esc(data.mode || "")} · 冲突 ${(data.conflicts || []).length} 条
       · 将撤销 ${data.revoke_count || 0} 条 · 文件哈希 ${esc((data.file_hash || "").slice(0, 16))}…</p>
-    ${(data.errors || []).length ? `<p class="hint">跳过 ${data.errors.length} 行：${esc(data.errors.slice(0, 5).join("；"))}${data.errors.length > 5 ? "…" : ""}</p>` : ""}
+    ${data.can_apply === false ? '<p class="hint">此预览不可执行，请先修正错误或冲突后重新预览。</p>' : ""}
+    ${(data.errors || []).length ? `<p class="hint">${data.can_apply === false ? "错误" : "跳过"} ${data.errors.length} 项：${esc(data.errors.slice(0, 5).join("；"))}${data.errors.length > 5 ? "…" : ""}</p>` : ""}
     ${(data.warnings || []).map((item) => `<p class="hint">${esc(item)}</p>`).join("")}
-    <p class="hint" style="margin-top:8px">冲突行不会被覆盖，需人工审。</p>
+    <p class="hint" style="margin-top:8px">冲突行不会被覆盖，也不会自动加入候选队列；请从列表编辑更正后重新预览。</p>
     ${conflictRows}
     ${revokeRows ? `<p class="hint" style="margin-top:8px">replace 将撤销：</p>${revokeRows}` : ""}`;
 }
