@@ -16,7 +16,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from ..core.prompt_parts import add_temp_part
+from ..core.prompt_parts import add_temp_part, next_temp_version, request_temp_source
 
 from ..core.contracts import Persona
 from ..core.exc import exc_brief
@@ -225,6 +225,20 @@ class PersonaService:
     async def resolve(self, umo: str = "", conversation: Any = None) -> dict[str, Any]:
         """每次输出重新解析唯一人格；指定角色不存在时禁止退回休眠角色。"""
         mode = self.mode
+        # LivingHello页面保存的人格是唯一选择，避免本插件再次覆盖框架人格。
+        fixed = None
+        if umo:
+            lookup = getattr(self.plugin.context, "get_registered_star", None)
+            try:
+                metadata = lookup("astrbot_plugin_at_guard") if callable(lookup) else None
+            except (KeyError, ValueError):
+                metadata = None
+            guard = getattr(metadata, "star_cls", None)
+            getter = getattr(guard, "get_fixed_native_persona_id", None)
+            if getattr(metadata, "activated", False) and callable(getter):
+                fixed = getter(umo)
+        if fixed is not None:
+            mode = MODE_NONE if fixed == "[%None]" else MODE_ASTRBOT
         dialogs: list[Any] = []
         if mode == MODE_BUILTIN:
             pid, name = self._persona.persona_id, self._persona.name
@@ -237,10 +251,11 @@ class PersonaService:
             manager = getattr(self.plugin.context, "persona_manager", None)
             if manager is None:
                 raise ValueError("AstrBot 人格管理器不可用")
-            pid = self.config.str("persona.astrbot_persona_id", "").strip()
+            pid = fixed if fixed is not None else self.config.str("persona.astrbot_persona_id", "").strip()
             if not pid and umo and hasattr(manager, "resolve_selected_persona"):
                 pid, _, _, _ = await manager.resolve_selected_persona(
-                    umo, getattr(conversation, "persona_id", None), umo.split(":", 1)[0]
+                    umo=umo, conversation_persona_id=getattr(conversation, "persona_id", None),
+                    platform_name=umo.split(":", 1)[0]
                 )
             pid = str(pid or getattr(manager, "default_persona", "default"))
             item = await manager.get_persona(pid)
@@ -337,7 +352,9 @@ class PersonaService:
         if scene:
             dynamic.append(scene)
         if dynamic:
-            add_temp_part(req, "\n\n".join(dynamic), "<!--congling:persona:dynamic-->")
+            add_temp_part(req, "\n\n".join(dynamic), "<!--congling:persona:dynamic-->",
+                source=request_temp_source(req, event, "congling.persona_dynamic",
+                    version=next_temp_version(req, "congling.persona_dynamic")))
 
     # ---------------------------------------------------------------- 分层
     async def _relation_line(self, event: Any) -> str:
